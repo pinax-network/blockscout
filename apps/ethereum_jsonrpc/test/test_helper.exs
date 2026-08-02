@@ -12,6 +12,8 @@ Mox.defmock(EthereumJSONRPC.Mox, for: EthereumJSONRPC.Transport)
 Mox.defmock(EthereumJSONRPC.HTTP.Mox, for: EthereumJSONRPC.HTTP)
 # for when we need to simulate WebSocket-specific stuff
 Mox.defmock(EthereumJSONRPC.WebSocket.Mox, for: EthereumJSONRPC.WebSocket)
+# for plain HTTP clients built on Tesla, such as the Firehose sidecar client
+Mox.defmock(Explorer.Mock.TeslaAdapter, for: Tesla.Adapter)
 
 ExUnit.configure(formatters: [JUnitFormatter, ExUnit.CLIFormatter])
 ExUnit.start()

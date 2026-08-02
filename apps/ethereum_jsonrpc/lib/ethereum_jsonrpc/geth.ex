@@ -104,8 +104,28 @@ defmodule EthereumJSONRPC.Geth do
     with {:ok, blocks_responses} <-
            id_to_params
            |> debug_trace_block_by_number_requests()
-           |> json_rpc(json_rpc_named_arguments),
-         :ok <- check_errors_exist(blocks_responses, id_to_params) do
+           |> json_rpc(json_rpc_named_arguments) do
+      block_traces_to_internal_transactions_params(blocks_responses, id_to_params, json_rpc_named_arguments)
+    end
+  end
+
+  @doc """
+  Converts `debug_traceBlockByNumber` responses to
+  `t:Explorer.Chain.InternalTransaction.changeset/2` params.
+
+  Split out of `fetch_block_internal_transactions/2` so that data sources which already hold the
+  traces - `EthereumJSONRPC.Firehose`, for one - can reuse this normalization rather than
+  duplicating it.
+
+  `id_to_params` maps each response id to the block number the traces belong to.
+  """
+  @spec block_traces_to_internal_transactions_params(
+          [%{id: non_neg_integer(), result: list()}],
+          %{non_neg_integer() => EthereumJSONRPC.block_number()},
+          EthereumJSONRPC.json_rpc_named_arguments()
+        ) :: {:ok, [EthereumJSONRPC.Variant.internal_transaction_params()]} | {:error, reason :: term()}
+  def block_traces_to_internal_transactions_params(blocks_responses, id_to_params, json_rpc_named_arguments) do
+    with :ok <- check_errors_exist(blocks_responses, id_to_params) do
       transactions_params = to_transactions_params(blocks_responses, id_to_params)
 
       {transactions_id_to_params, transactions_responses} =

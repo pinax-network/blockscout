@@ -123,7 +123,9 @@ defmodule Indexer.Block.Catchup.Fetcher do
     with {:import, {:ok, imported} = ok} <- {:import, Chain.import(full_chain_import_options)} do
       async_import_remaining_block_data(
         imported,
-        Map.put(async_import_remaining_block_data_options, :block_rewards, %{errors: block_reward_errors})
+        async_import_remaining_block_data_options
+        |> Map.put(:block_rewards, %{errors: block_reward_errors})
+        |> Map.put(:internal_transactions_imported?, Map.has_key?(options, :internal_transactions))
       )
 
       ContractCreatorOnDemand.async_update_cache_of_contract_creator_on_demand(imported)
@@ -134,14 +136,14 @@ defmodule Indexer.Block.Catchup.Fetcher do
 
   defp async_import_remaining_block_data(
          imported,
-         %{block_rewards: %{errors: block_reward_errors}}
+         %{block_rewards: %{errors: block_reward_errors}} = options
        ) do
     realtime? = false
 
     async_import_block_rewards(block_reward_errors, realtime?)
     async_import_coin_balances(imported)
     async_import_created_contract_codes(imported, realtime?)
-    async_import_internal_transactions(imported, realtime?)
+    maybe_async_import_internal_transactions(imported, options, realtime?)
     async_import_tokens(imported, realtime?)
     async_import_token_balances(imported, realtime?)
     async_import_current_token_balances(imported, realtime?)
@@ -154,6 +156,16 @@ defmodule Indexer.Block.Catchup.Fetcher do
     async_import_filecoin_addresses_info(imported, realtime?)
     async_import_signed_authorizations_statuses(imported, realtime?)
   end
+
+  # When the block source supplied traces, they were imported in the same transaction that created
+  # the pending block operations, so the queue is already drained and there is nothing left to
+  # trace. Queueing anyway would send the whole range back to the node's tracer and undo the point
+  # of sourcing the traces in the first place.
+  defp maybe_async_import_internal_transactions(_imported, %{internal_transactions_imported?: true}, _realtime?),
+    do: :ok
+
+  defp maybe_async_import_internal_transactions(imported, _options, realtime?),
+    do: async_import_internal_transactions(imported, realtime?)
 
   defp stream_fetch_and_import(state, ranges) do
     TaskSupervisor

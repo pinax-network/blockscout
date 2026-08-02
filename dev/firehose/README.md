@@ -1,0 +1,110 @@
+# Firehose-backed backfill — local setup
+
+> Design, field mapping and parity results live in [`docs/firehose-overview.md`](../../docs/firehose-overview.md),
+> [`docs/firehose-block-mapping.md`](../../docs/firehose-block-mapping.md) and
+> [`docs/firehose-parity.md`](../../docs/firehose-parity.md). This file is just how to run it locally.
+
+Blockscout's catchup (backfill) pipeline normally rebuilds each block range from three passes
+against a JSON-RPC node: `eth_getBlockByNumber`, `eth_getBlockReceipts`, and a deferred
+`debug_traceBlockByNumber` per block driven off `pending_block_operations`. With
+`INDEXER_FIREHOSE_URL` set, catchup instead gets blocks, receipts, logs and call traces from a
+Firehose-backed sidecar in one request per range, and imports the internal transactions in the
+same database transaction as the blocks.
+
+Realtime is unaffected — it keeps following the head over JSON-RPC, where its reorg detection lives.
+
+## Configuration
+
+| Variable | Meaning |
+|---|---|
+| `INDEXER_FIREHOSE_URL` | Sidecar endpoint. Unset (default) = stock JSON-RPC behaviour. |
+| `INDEXER_FIREHOSE_TIMEOUT` | Request timeout, default `60s`. |
+
+## Sidecar contract
+
+`EthereumJSONRPC.Firehose` posts
+
+```json
+{"start_block": 61, "end_block": 70}
+```
+
+and expects `200` with
+
+```json
+{"blocks": [{"number": 61, "block": {...}, "receipts": [...], "traces": [...]}]}
+```
+
+`block`, `receipts` and `traces` are the **verbatim** results of `eth_getBlockByNumber` (with full
+transaction objects), `eth_getBlockReceipts`, and `debug_traceBlockByNumber` with `callTracer`.
+Keeping them verbatim means the payload goes through the same parsers as node responses, so
+Firehose-sourced and node-sourced data cannot drift apart.
+
+Requirements:
+
+- `number` is always present, even when `block` is `null`, so a block the sidecar could not produce
+  is reported against the right block number.
+- `receipts` must contain a receipt for every transaction in `block` —
+  `Indexer.Block.Fetcher.Receipts.put/2` looks them up with `Map.fetch!/2`.
+- Ranges are requested ascending; the catchup fetcher's descending ranges are normalized first.
+
+See the moduledoc in `apps/ethereum_jsonrpc/lib/ethereum_jsonrpc/firehose.ex` for the authoritative
+version.
+
+## Files here
+
+- `firehose-sidecar.js` — **the real one.** Streams `sf.ethereum.type.v2.Block` over gRPC via
+  `sf.firehose.v2.Stream/Blocks` and reshapes each block into the three payloads.
+- `rpc-sidecar.js` — a test double backed by a plain JSON-RPC node, for exercising the Blockscout
+  side without a Firehose endpoint.
+- `proto/` — `sf/firehose/v2/firehose.proto` and `sf/ethereum/type/v2/type.proto`. Note these come
+  from **two different Buf modules**: `streamingfast/firehose` (the Stream service) and
+  `streamingfast/firehose-ethereum` (the block type). `Response.block` is a `google.protobuf.Any`
+  that must be unpacked against the latter.
+- `local-env.sh` — environment for a local indexer-only run.
+- `verify.sql` — row counts, internal transactions, and a fingerprint of the indexed data for
+  comparing a Firehose run against a stock JSON-RPC run.
+
+## Running against a Firehose endpoint
+
+```bash
+cd dev/firehose && npm install
+FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> PORT=8082 FIREHOSE_WORKERS=8 \
+  node firehose-sidecar.js
+```
+
+## Known fidelity gaps vs a node's callTracer
+
+- **CREATE2 is indistinguishable from CREATE.** `sf.ethereum.type.v2.CallType` has no `CREATE2`
+  member, so a create2 internal transaction is recorded as `:create` rather than `:create2`.
+  Recovering it would mean inferring from `Call.keccak_preimages`.
+- **`eth_call` is not covered.** Firehose carries storage changes, not arbitrary state queries, so
+  token metadata (`name`/`symbol`/`decimals`), `balanceOf`, and contract reads still need an
+  archive RPC. This does not affect the block/receipt/trace backfill path, but it means Blockscout
+  still needs a node for its on-demand and token fetchers.
+- **Pending transactions** are not in Firehose, since they are not in blocks.
+
+## Running the local end-to-end test
+
+```bash
+# devnet + datastores
+docker run -d --name fh-anvil -p 8545:8545 ghcr.io/foundry-rs/foundry:latest \
+  "anvil --host 0.0.0.0 --chain-id 31337 --block-time 2 --steps-tracing"
+docker run -d --name fh-db -e POSTGRES_DB=blockscout -e POSTGRES_USER=blockscout \
+  -e POSTGRES_PASSWORD=blockscout -p 7432:5432 --shm-size=256m postgres:17
+docker run -d --name fh-redis -p 6379:6379 redis:7
+
+# connector (RPC-backed test double - no Firehose endpoint needed)
+RPC_URL=http://127.0.0.1:8545 PORT=8081 node dev/firehose/rpc-sidecar.js &
+
+# indexer
+source dev/firehose/local-env.sh
+export BLOCK_RANGES="1..70" INDEXER_FIREHOSE_URL="http://127.0.0.1:8081"
+mix ecto.create && mix ecto.migrate
+mix run --no-halt
+```
+
+Then `psql ... -f dev/firehose/verify.sql`. `pending_block_operations` should be `0` — the traces
+were imported inline rather than queued for the node's tracer.
+
+To compare against stock behaviour, truncate the chain tables, unset `INDEXER_FIREHOSE_URL`, re-run,
+and check the fingerprints match.

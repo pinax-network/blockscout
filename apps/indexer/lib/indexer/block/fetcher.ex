@@ -89,7 +89,21 @@ defmodule Indexer.Block.Fetcher do
           callback_module: callback_module,
           json_rpc_named_arguments: EthereumJSONRPC.json_rpc_named_arguments(),
           receipts_batch_size: pos_integer(),
-          receipts_concurrency: pos_integer()
+          receipts_concurrency: pos_integer(),
+          source: module() | nil
+        }
+
+  @typedoc """
+  Everything needed to import one block range.
+
+  `:receipts` and `:internal_transactions` are `nil` when the source did not supply them, in which
+  case they are fetched by their own passes - `Indexer.Block.Fetcher.Receipts` now, and
+  `Indexer.Fetcher.InternalTransaction` later, off `pending_block_operations`.
+  """
+  @type range_data :: %{
+          blocks: Blocks.t(),
+          receipts: %{logs: [map()], receipts: [map()]} | nil,
+          internal_transactions: [map()] | nil
         }
 
   @doc """
@@ -132,7 +146,8 @@ defmodule Indexer.Block.Fetcher do
             task_supervisor: nil,
             json_rpc_named_arguments: nil,
             receipts_batch_size: @receipts_batch_size,
-            receipts_concurrency: @receipts_concurrency
+            receipts_concurrency: @receipts_concurrency,
+            source: nil
 
   @doc """
   Required named arguments
@@ -147,6 +162,9 @@ defmodule Indexer.Block.Fetcher do
       block.  *These logs are not paginated.*
     * `:receipts_concurrency` - The number of concurrent requests of `:receipts_batch_size` to allow against the JSONRPC
       **for each block range**.  Defaults to `#{@receipts_concurrency}`.  *Each transaction only has one receipt.*
+    * `:source` - A module exporting `fetch_range/1` that supplies block range data from somewhere other than the
+      JSONRPC node - see `EthereumJSONRPC.Firehose`.  Defaults to `nil`, meaning blocks come from the node and
+      receipts and internal transactions are fetched by their own passes.
 
   """
   def new(named_arguments) when is_map(named_arguments) do
@@ -170,10 +188,9 @@ defmodule Indexer.Block.Fetcher do
         additional_options \\ %{}
       )
       when callback_module != nil do
-    {fetch_time, fetch_result} =
-      :timer.tc(fn -> EthereumJSONRPC.fetch_blocks_by_range(range, json_rpc_named_arguments) end)
+    {fetch_time, fetch_result} = :timer.tc(fn -> fetch_range(state, range) end)
 
-    with {:blocks, {:ok, fetched_blocks}} <- {:blocks, fetch_result},
+    with {:blocks, {:ok, %{blocks: fetched_blocks} = range_data}} <- {:blocks, fetch_result},
          %Blocks{
            blocks_params: blocks_params,
            transactions_params: transactions_params_without_receipts,
@@ -181,8 +198,10 @@ defmodule Indexer.Block.Fetcher do
            block_second_degree_relations_params: block_second_degree_relations_params,
            errors: blocks_errors
          } = filtered_fetched_blocks = process_massive_blocks(fetched_blocks, callback_module),
+         range_data = reject_massive_blocks_data(range_data, filtered_fetched_blocks),
          blocks = TransformBlocks.transform_blocks(blocks_params),
-         {:receipts, {:ok, receipt_params}} <- {:receipts, Receipts.fetch(state, transactions_params_without_receipts)},
+         {:receipts, {:ok, receipt_params}} <-
+           {:receipts, fetch_receipts(state, range_data, transactions_params_without_receipts)},
          %{logs: receipt_logs, receipts: receipts} = receipt_params,
          transactions_with_receipts = Receipts.put(transactions_params_without_receipts, receipts),
          celo_epoch_logs = CeloEpochLogs.fetch(blocks, json_rpc_named_arguments),
@@ -271,7 +290,7 @@ defmodule Indexer.Block.Fetcher do
          {:ok, inserted} <-
            __MODULE__.import(
              state,
-             merge_options(basic_import_options, additional_options)
+             merge_options(basic_import_options, prefetched_options(range_data, blocks, additional_options))
              |> import_options(chain_type_import_options)
              |> extend_with_asyncable_import_options(tokens, token_transfers, address_token_balances, callback_module)
            ) do
@@ -300,6 +319,84 @@ defmodule Indexer.Block.Fetcher do
       {:import, {:error, step, failed_value, changes_so_far}} -> {:error, {step, failed_value, changes_so_far}}
     end
   end
+
+  # Fetches everything known about `range` up front. The default source is the JSONRPC node, which
+  # only yields blocks - receipts follow in their own pass and internal transactions are deferred
+  # through `pending_block_operations`. A `:source` module can supply all three at once, which is
+  # what makes a Firehose-backed backfill a single round trip per range instead of three passes.
+  @spec fetch_range(t(module()), Range.t()) :: {:ok, range_data()} | {:error, reason :: term()}
+  defp fetch_range(%__MODULE__{source: nil, json_rpc_named_arguments: json_rpc_named_arguments}, range) do
+    with {:ok, %Blocks{} = blocks} <- EthereumJSONRPC.fetch_blocks_by_range(range, json_rpc_named_arguments) do
+      {:ok, %{blocks: blocks, receipts: nil, internal_transactions: nil}}
+    end
+  end
+
+  defp fetch_range(%__MODULE__{source: source}, range), do: source.fetch_range(range)
+
+  defp fetch_receipts(state, %{receipts: nil}, transactions_params_without_receipts),
+    do: Receipts.fetch(state, transactions_params_without_receipts)
+
+  defp fetch_receipts(_state, %{receipts: receipts}, _transactions_params_without_receipts), do: {:ok, receipts}
+
+  # Internal transactions supplied by the source are imported in the same transaction as the
+  # blocks: `Import.Runner.Transactions` inserts the `pending_block_operations` rows in stage 2 and
+  # `Import.Runner.InternalTransactions` consumes and deletes them in stage 3. The queue is
+  # therefore drained within the same `Explorer.Chain.Import.all/1` call that filled it, and
+  # `Indexer.Fetcher.InternalTransaction` never has to trace these blocks.
+  defp prefetched_options(%{internal_transactions: nil}, _blocks, additional_options), do: additional_options
+
+  defp prefetched_options(%{internal_transactions: internal_transactions}, blocks, additional_options) do
+    marked_internal_transactions = InternalTransaction.mark_failed_transactions(internal_transactions)
+
+    # Every imported block has to appear in the params, including blocks with no internal
+    # transactions at all: `Import.Runner.InternalTransactions` derives the blocks whose pending
+    # operations to acquire from these params, so a block missing here keeps its
+    # `pending_block_operations` row forever. Trace-less blocks are represented by a bare
+    # `%{block_number: number}`, which is what `:blockless_changeset` exists to accept.
+    traced_block_numbers = MapSet.new(marked_internal_transactions, & &1.block_number)
+
+    empty_block_numbers =
+      blocks
+      |> Enum.reject(&MapSet.member?(traced_block_numbers, &1.number))
+      |> Enum.map(&%{block_number: &1.number})
+
+    merge_options(additional_options, %{
+      internal_transactions: %{
+        params: marked_internal_transactions ++ empty_block_numbers,
+        with: :blockless_changeset
+      }
+    })
+  end
+
+  # `process_massive_blocks/2` defers oversized blocks to the catchup pipeline by dropping them
+  # from the fetched data. Prefetched logs and internal transactions have to be dropped alongside
+  # them - otherwise they reference transactions that are never imported, and the internal
+  # transaction runner flags the range as needing a refetch.
+  #
+  # Receipts need no filtering: `Receipts.put/2` maps over the surviving transactions and looks
+  # receipts up by hash, so extra ones are ignored.
+  defp reject_massive_blocks_data(%{receipts: nil, internal_transactions: nil} = range_data, _filtered_fetched_blocks),
+    do: range_data
+
+  defp reject_massive_blocks_data(range_data, %Blocks{blocks_params: blocks_params}) do
+    retained_block_numbers = MapSet.new(blocks_params, & &1.number)
+
+    %{
+      range_data
+      | receipts: reject_logs_by_block_number(range_data[:receipts], retained_block_numbers),
+        internal_transactions: reject_by_block_number(range_data[:internal_transactions], retained_block_numbers)
+    }
+  end
+
+  defp reject_logs_by_block_number(nil, _retained_block_numbers), do: nil
+
+  defp reject_logs_by_block_number(%{logs: logs} = receipts, retained_block_numbers),
+    do: %{receipts | logs: reject_by_block_number(logs, retained_block_numbers)}
+
+  defp reject_by_block_number(nil, _retained_block_numbers), do: nil
+
+  defp reject_by_block_number(params, retained_block_numbers),
+    do: Enum.filter(params, &MapSet.member?(retained_block_numbers, &1[:block_number]))
 
   defp process_massive_blocks(fetched_blocks, MassiveBlocksFetcher), do: fetched_blocks
 
