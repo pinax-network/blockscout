@@ -45,18 +45,31 @@ size and concurrency. Completion means **fully indexed including traces**: all b
 present" would compare blocks-only against blocks-plus-traces and flatter the Firehose path
 substantially, since traces arrive asynchronously on the RPC path.
 
-**Result** — Robinhood Chain, blocks 25899000–25899499, Blockscout defaults
-(`INDEXER_CATCHUP_BLOCKS_BATCH_SIZE=10`, `CONCURRENCY=10`):
+**Result** — Robinhood Chain, Blockscout defaults (`INDEXER_CATCHUP_BLOCKS_BATCH_SIZE=10`,
+`CONCURRENCY=10`), connector on 8 workers.
 
-| run | elapsed | blocks | txs | logs | internal txs |
+5,000 blocks (25890000–25894999):
+
+| run | elapsed | blocks/s | txs | logs | internal txs |
 |---|---|---|---|---|---|
-| JSON-RPC baseline | 41s | 500 | 3640 | 9739 | 38,676 |
-| Firehose, 1 worker, pre-fixes | 50s | 500 | 3640 | 9739 | 37,576 |
-| Firehose, 8 workers, `system_calls` | 29s | 500 | 3640 | 9739 | 38,576 |
-| **Firehose, 8 workers, all fixes** | **29s** | 500 | 3640 | 9739 | **38,676** |
+| JSON-RPC baseline | 207s | 24.2 | 30,567 | 100,781 | 360,444 |
+| **Firehose** | **121s** | **41.3** | 30,567 | 100,781 | **360,444** |
 
-Blocks, transactions, logs and internal transactions all match the RPC baseline exactly, at ~1.4x
-the speed.
+**1.71x**, with every count identical.
+
+500 blocks (25899000–25899499), showing how the earlier defects were found and closed:
+
+| run | elapsed | txs | logs | internal txs |
+|---|---|---|---|---|
+| JSON-RPC baseline | 41s | 3640 | 9739 | 38,676 |
+| Firehose, 1 worker, pre-fixes | 50s | 3640 | 9739 | 37,576 |
+| Firehose, 8 workers, `system_calls` | 29s | 3640 | 9739 | 38,576 |
+| Firehose, 8 workers, all fixes | 29s | 3640 | 9739 | **38,676** |
+
+The advantage grows with range size — 1.41x over 500 blocks, 1.71x over 5,000 — because per-stream
+setup amortises while the node's per-block trace call does not. Extrapolating the 5,000-block rates
+to Robinhood's ~25.9M blocks: ~7.3 days via Firehose against ~12.4 days via RPC, on one indexer
+with default concurrency.
 
 `pending_block_operations` stays at 0 for the whole Firehose run: traces are imported in the same
 transaction that creates the queue entries, so the node's tracer is never asked for anything.
