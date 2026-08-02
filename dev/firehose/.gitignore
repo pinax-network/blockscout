@@ -1,3 +1,6 @@
 .env
 node_modules/
 package-lock.json
+
+# the repo root ignores *.env.example; this one is documentation and must be tracked
+!.env.example
