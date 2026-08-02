@@ -10,21 +10,41 @@
 //   POST /v1/blocks  {"start_block": 1, "end_block": 10}
 //   -> {"blocks": [{"number", "block", "receipts", "traces"}, ...]}
 //
-// Usage:
-//   FIREHOSE_ENDPOINT=chain.firehose.pinax.network:443 PINAX_KEY=... PORT=8081 node firehose-sidecar.js
+// Usage - see .env.example for the full set:
+//   FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> PORT=8082 node firehose-sidecar.js
 
 const http = require("http");
 const path = require("path");
+const fs = require("fs");
 const cluster = require("cluster");
 const os = require("os");
 const grpc = require("@grpc/grpc-js");
 const protoLoader = require("@grpc/proto-loader");
 const protobuf = require("protobufjs");
 
+// Load a .env sitting next to this file, if present, without pulling in a dependency. Real
+// environment variables always win, so the file is only a convenience for local runs.
+(function loadDotEnv() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) return;
+  for (const line of fs.readFileSync(envPath, "utf8").split("\n")) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*)\s*$/i);
+    if (!m) continue;
+    const key = m[1];
+    const value = m[2].replace(/^['"]|['"]$/g, "");
+    if (!(key in process.env)) process.env[key] = value;
+  }
+})();
+
 const ENDPOINT = process.env.FIREHOSE_ENDPOINT || "localhost:10015";
-const API_KEY = process.env.FIREHOSE_API_KEY || process.env.PINAX_KEY || "";
 const PORT = parseInt(process.env.PORT || "8081", 10);
 const PLAINTEXT = process.env.FIREHOSE_PLAINTEXT === "true";
+
+// Firehose providers authenticate in one of two ways. Pinax and StreamingFast's hosted endpoints
+// take a long-lived key in `x-api-key`; deployments fronted by StreamingFast's auth service take a
+// short-lived JWT in `authorization: bearer <token>`. Set whichever your provider issues.
+const API_KEY = process.env.FIREHOSE_API_KEY || process.env.PINAX_KEY || "";
+const BEARER_TOKEN = process.env.FIREHOSE_BEARER_TOKEN || "";
 
 const PROTO_OPTS = {
   keepCase: false,
@@ -65,6 +85,7 @@ const client = makeClient();
 function metadata() {
   const md = new grpc.Metadata();
   if (API_KEY) md.set("x-api-key", API_KEY);
+  if (BEARER_TOKEN) md.set("authorization", `bearer ${BEARER_TOKEN}`);
   return md;
 }
 
@@ -370,6 +391,14 @@ function fetchRange(startBlock, endBlock) {
     });
     stream.on("error", (e) => {
       if (e.code === grpc.status.CANCELLED) return;
+      if (e.code === grpc.status.UNAUTHENTICATED || e.code === grpc.status.PERMISSION_DENIED) {
+        return reject(
+          new Error(
+            `firehose auth rejected (${e.details || e.message}). ` +
+              `Set FIREHOSE_API_KEY (or FIREHOSE_BEARER_TOKEN) - see dev/firehose/.env.example`
+          )
+        );
+      }
       reject(new Error(`firehose stream: ${e.details || e.message}`));
     });
     stream.on("end", () => resolve(out));
@@ -389,7 +418,12 @@ const server = http.createServer(async (req, res) => {
   };
 
   if (req.method === "GET" && req.url === "/health") {
-    return send(200, { ok: true, endpoint: ENDPOINT, source: "firehose" });
+    return send(200, {
+      ok: true,
+      endpoint: ENDPOINT,
+      source: "firehose",
+      auth: API_KEY ? "api-key" : BEARER_TOKEN ? "bearer" : "none",
+    });
   }
   if (req.method !== "POST") return send(405, { error: "method not allowed" });
 
@@ -434,6 +468,14 @@ function countFrames(frame) {
 // concurrently, which makes it - not Firehose - the bottleneck. Fork one worker per core and let
 // the kernel spread the accepted connections across them.
 const WORKERS = parseInt(process.env.FIREHOSE_WORKERS || String(Math.max(1, os.cpus().length - 2)), 10);
+
+if (cluster.isPrimary && !API_KEY && !BEARER_TOKEN) {
+  console.warn(
+    `[firehose] WARNING: neither FIREHOSE_API_KEY nor FIREHOSE_BEARER_TOKEN is set - requests to ` +
+      `${ENDPOINT} will be sent unauthenticated and will most likely be rejected. ` +
+      `See dev/firehose/.env.example`
+  );
+}
 
 if (cluster.isPrimary && WORKERS > 1) {
   console.log(`[firehose] primary ${process.pid}: forking ${WORKERS} workers, upstream ${ENDPOINT}`);

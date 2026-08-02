@@ -68,9 +68,20 @@ version.
 
 ```bash
 cd dev/firehose && npm install
+cp .env.example .env    # then fill in FIREHOSE_ENDPOINT and your auth
+node firehose-sidecar.js
+```
+
+Or pass them inline:
+
+```bash
 FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> PORT=8082 FIREHOSE_WORKERS=8 \
   node firehose-sidecar.js
 ```
+
+Firehose endpoints require auth — set `FIREHOSE_API_KEY` (sent as `x-api-key`) or
+`FIREHOSE_BEARER_TOKEN` (sent as `authorization: bearer`). `GET /health` reports which is active.
+`.env` is gitignored; never commit a key.
 
 ## Known fidelity gaps vs a node's callTracer
 

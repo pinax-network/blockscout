@@ -59,15 +59,25 @@ The trade is JSON transcoding cost, which is real and is the connector's through
 | `INDEXER_FIREHOSE_URL` | Connector endpoint. Unset = stock JSON-RPC behaviour. |
 | `INDEXER_FIREHOSE_TIMEOUT` | Request timeout, default `60s`. Raise for large ranges. |
 
-Connector-side:
+Connector-side — see [`dev/firehose/.env.example`](../dev/firehose/.env.example). A `.env` file
+next to the connector is read automatically; real environment variables take precedence.
 
 | Variable | Meaning |
 |---|---|
 | `FIREHOSE_ENDPOINT` | `host:port` of the Firehose gRPC endpoint |
-| `FIREHOSE_API_KEY` | Sent as the `x-api-key` metadata header |
+| `FIREHOSE_API_KEY` | Long-lived key, sent as `x-api-key`. Pinax / StreamingFast hosted endpoints. |
+| `FIREHOSE_BEARER_TOKEN` | Short-lived JWT, sent as `authorization: bearer <token>`. Deployments behind StreamingFast's auth service. |
 | `FIREHOSE_WORKERS` | Worker processes; defaults to `cores - 2` |
 | `PORT` | HTTP listen port, default `8081` |
 | `FIREHOSE_PLAINTEXT` | `true` for a non-TLS endpoint |
+
+**Firehose endpoints require authentication.** Set exactly one of `FIREHOSE_API_KEY` or
+`FIREHOSE_BEARER_TOKEN` — whichever your provider issues. The connector warns at startup if
+neither is present, and `GET /health` reports which mode is active:
+
+```json
+{"ok": true, "endpoint": "...", "source": "firehose", "auth": "api-key"}
+```
 
 ## Scope and limits
 
