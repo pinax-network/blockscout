@@ -7,6 +7,21 @@ All figures are from Robinhood Chain: 2,000 blocks (25899000–25900999, 16,283 
 the payload and coverage measurements, and 1,000 blocks for the sample verified against `eth_call`.
 Reproduce with `dev/firehose/analyze-coverage.js`.
 
+## Design rule: derive only what is *recorded*, never what is *inferred*
+
+Anything not provably exact falls back to `eth_call`/`eth_getBalance`. That rule draws a clean line
+through this analysis, and it excludes token balances.
+
+| Source | Nature | Verified vs node |
+|---|---|---|
+| `balance_changes` → `eth_getBalance` | recorded state | **100.00%** (400/400) |
+| `code_changes` → `eth_getCode` | recorded state | recorded, same class |
+| `nonce_changes` → nonces | recorded state | recorded, same class |
+| `storage_changes` → `balanceOf` | **inferred** | 94.2% best case — excluded |
+
+Recorded fields are what the node itself wrote down. Inferring `balanceOf` means guessing that a
+storage word *is* the balance, and that guess cannot be made safe — see below.
+
 ## The residual load
 
 Blockscout's enrichment fetchers issue one call per row of work discovered while importing blocks:
@@ -67,8 +82,7 @@ storage_change.key -> keccak_preimages[key] -> abi.encode(holder, slot)
 ```
 
 **Coverage, measured over 2,000 blocks:** of 21,995 `(token, holder)` pairs Blockscout would issue
-`balanceOf` for, **25.8% resolve** from storage. Over a 1,000-block window the figure is 29.8%.
-This is the number that matters, and it is far below what the mechanism suggests in isolation.
+`balanceOf` for, 80.5% resolve to a storage slot and **48.3% survive validation gates**.
 
 **Accuracy, verified against the node:** every derived balance was checked with an actual
 `eth_call balanceOf(holder)` at the same block.
@@ -82,13 +96,36 @@ verified 599 derived balances against eth_call balanceOf()   (46 tokens)
   accuracy       : 71.9%
 ```
 
-A first pass over 60 samples showed 98.3%; that was a small-sample artifact and did not survive
-widening. **Packed storage slots are common, not exceptional** — 27% of resolved balances share
-their 32-byte word with another field, so reading the whole word gives a number that is wrong by
-orders of magnitude.
+A first pass over 60 samples showed 98.3%; that was a small-sample artifact. Ungated accuracy over
+599 samples is 71.9%, dominated by packed slots. Three self-contained gates were then added:
 
-Compounding the two figures, the share of `balanceOf` calls that can be replaced *correctly and
-generically* is `25.8% × 71.9%` ≈ **19%**.
+1. **Delta agreement** — the storage word must move by exactly the amount in the `Transfer` log.
+2. **Unpacked proof** — a word going `0 → exactly the amount received` proves nothing else shares
+   it, certifying that `(token, slot)`.
+3. **Final write** — must be the highest-`ordinal` write to that word in the block, tracked across
+   *all* writes including unresolvable ones, since `eth_call` returns end-of-block state.
+
+Gated accuracy reaches **94.2%** (752/798) at 48.3% coverage. It does not reach 100%, and the
+reason is structural.
+
+#### Why the last 6% cannot be closed
+
+The residual failures are **yield-bearing tokens**, where `balanceOf()` applies an accrual factor
+at read time rather than returning a stored number:
+
+```
+derived  = 5074002286930471045
+eth_call = 5073938167231311660     ratio 1.0000126
+```
+
+Stored principal moves by exactly the transferred amount, so gate 1 passes; the read then adds
+accrual, so the absolute is wrong. Nothing in the block distinguishes this from a plain balance.
+
+Per-token certification does not rescue it: of 68 tokens observed, **4 were mixed** — correct at
+some blocks and wrong at others, because accrual is time-dependent, not token-dependent. A token
+can pass a probe and be wrong an hour later.
+
+Under a 100%-or-fall-back rule, `balanceOf` derivation is therefore **excluded entirely**.
 
 `storage_changes` carry `old_value` and `new_value`, so results are **absolute balances**, not
 deltas — no accumulation from genesis required.
@@ -140,16 +177,17 @@ Measured, per block, over 2,000 blocks:
 | Work | Needed/block | Derivable | Residual/block |
 |---|---|---|---|
 | `eth_getBalance` | 13.5 | 100% | 0 |
-| `balanceOf` | 11.0 | 25.8% resolve × 71.9% correct ≈ **19%** | 8.9 |
+| `balanceOf` | 11.0 | excluded — cannot be proven exact | 11.0 |
 | `eth_getCode` | sporadic | 100% | 0 |
 | `tokenURI` | 1.9 | 0% | 1.9 |
 | token metadata | one-time/token | 0% | one-time |
 
-**Roughly 59% of the recurring per-block node calls are addressable — and essentially all of that
-is `eth_getBalance`.** `balanceOf` derivation contributes about 2 of the ~26 calls/block once both
-coverage and correctness are applied, and buying those 2 costs per-contract storage-layout
-knowledge. On this evidence it is not worth building generically; native balances, contract code
-and nonces are.
+Applying the rule — derive only recorded state, fall back otherwise — **~51% of recurring
+per-block node calls are replaceable at verified 100% accuracy**, essentially all of it
+`eth_getBalance` (13.5 calls/block, 400/400 exact).
+
+`balanceOf` is the other half and is excluded on principle: a gated derivation reaches 94.2%, but
+the failures are undetectable from block data and a wrong balance is worse than an extra RPC call.
 
 That is a real reduction but **not** node elimination. The honest positioning: Firehose removes the
 *expensive* calls (`debug_traceBlockByNumber`, which many providers do not expose) outright, and
