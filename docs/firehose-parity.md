@@ -107,7 +107,8 @@ Interpretation caveats, both of which understate the Firehose advantage:
 - The baseline is a **well-provisioned archive endpoint with `debug_traceBlockByNumber` enabled**.
   Many hosted RPCs do not expose `debug_*` at all, in which case there is no baseline to compare —
   Blockscout simply cannot backfill internal transactions.
-- 500 blocks is small. The gap should widen over larger ranges, where per-stream setup amortises.
+- Measured at 5,000 blocks. The gap widened from 1.41x to 1.71x going from 500 to 5,000, so
+  larger backfills should do better still.
 
 ## Reproducing
 
