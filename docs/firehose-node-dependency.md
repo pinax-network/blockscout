@@ -14,7 +14,7 @@ through this analysis, and it excludes token balances.
 
 | Source | Nature | Verified vs node |
 |---|---|---|
-| `balance_changes` → `eth_getBalance` | recorded state | **100.00%** (400/400) |
+| `balance_changes` → `eth_getBalance` | recorded state | **100.00%** — 400/400 raw, 300/300 end-to-end (**implemented**) |
 | `code_changes` → `eth_getCode` | recorded state | recorded, same class |
 | `nonce_changes` → nonces | recorded state | recorded, same class |
 | `storage_changes` → `balanceOf` | **inferred** | 94.2% best case — excluded |
@@ -184,7 +184,12 @@ Measured, per block, over 2,000 blocks:
 
 Applying the rule — derive only recorded state, fall back otherwise — **~51% of recurring
 per-block node calls are replaceable at verified 100% accuracy**, essentially all of it
-`eth_getBalance` (13.5 calls/block, 400/400 exact).
+`eth_getBalance` (13.5 calls/block).
+
+**Native balances are now implemented.** Indexing 200 Robinhood blocks, 2,903 of 4,163 coin balance
+rows (70%) arrived already valued from `balance_changes`; a 300-row random sample from Blockscout's
+database matched `eth_getBalance` at the same block **300/300**. The remaining 30% are addresses
+the block touched without moving their balance, which still fall back to the node.
 
 `balanceOf` is the other half and is excluded on principle: a gated derivation reaches 94.2%, but
 the failures are undetectable from block data and a wrong balance is worse than an extra RPC call.

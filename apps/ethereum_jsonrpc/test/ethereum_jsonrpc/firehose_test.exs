@@ -83,6 +83,10 @@ defmodule EthereumJSONRPC.FirehoseTest do
           "contractAddress" => nil
         }
       ],
+      "balanceChanges" => [
+        %{"address" => @from, "value" => "0x2e85d789c5e1b"},
+        %{"address" => @forwarder, "value" => "0x0"}
+      ],
       "traces" => [
         %{
           "txHash" => @transaction_hash,
@@ -161,6 +165,32 @@ defmodule EthereumJSONRPC.FirehoseTest do
       assert {:ok, _range_data} = Firehose.fetch_range(61..70)
 
       assert_receive {:sidecar_request, %{"start_block" => 61, "end_block" => 70}}
+    end
+
+    test "returns native balances already valued, so eth_getBalance is never issued for them" do
+      stub_sidecar([entry(64)])
+
+      assert {:ok, %{coin_balances: coin_balances}} = Firehose.fetch_range(64..64)
+
+      assert [from_balance, forwarder_balance] =
+               Enum.sort_by(coin_balances, & &1.address_hash)
+               |> Enum.sort_by(&(&1.address_hash != @from))
+
+      assert from_balance.address_hash == @from
+      assert from_balance.block_number == 64
+      assert from_balance.value == 0x2E85D789C5E1B
+
+      # a zero balance is still a known balance, not a missing one
+      assert forwarder_balance.value == 0
+
+      # value_fetched_at is what keeps CoinBalance.stream_unfetched_balances/3 from re-fetching
+      assert Enum.all?(coin_balances, &match?(%DateTime{}, &1.value_fetched_at))
+    end
+
+    test "omits coin balances when the sidecar reports none" do
+      stub_sidecar([Map.delete(entry(64), "balanceChanges")])
+
+      assert {:ok, %{coin_balances: []}} = Firehose.fetch_range(64..64)
     end
 
     test "reports a block the sidecar could not produce as an error rather than dropping it" do

@@ -204,6 +204,28 @@ function buildCallTree(calls) {
   return root;
 }
 
+// Final native balance per account in the block. balance_changes are recorded state - the node
+// wrote these values down - so unlike a storage-derived token balance they need no interpretation
+// and verify 1:1 against eth_getBalance. Ordinals give the total order, so the highest-ordinal
+// change per address is the end-of-block value.
+function coinBalances(block) {
+  const final = new Map();
+  const take = (bc) => {
+    const address = addr(bc.address);
+    if (!address) return;
+    const ordinal = Number(bc.ordinal || 0);
+    const prev = final.get(address);
+    if (!prev || ordinal > prev.ordinal) final.set(address, { ordinal, value: bigIntQty(bc.newValue) });
+  };
+
+  for (const bc of block.balanceChanges || []) take(bc);      // block-level, e.g. rewards
+  for (const c of block.systemCalls || []) for (const bc of c.balanceChanges || []) take(bc);
+  for (const t of block.transactionTraces || [])
+    for (const c of t.calls || []) for (const bc of c.balanceChanges || []) take(bc);
+
+  return [...final].map(([address, v]) => ({ address, value: v.value }));
+}
+
 function convertBlock(block) {
   const header = block.header || {};
   const number = Number(block.number);
@@ -319,6 +341,7 @@ function convertBlock(block) {
     },
     receipts,
     traces: callTraces,
+    balanceChanges: coinBalances(block),
   };
 }
 
@@ -448,8 +471,10 @@ const server = http.createServer(async (req, res) => {
       (a, b) => a + b.traces.reduce((n, t) => n + countFrames(t.result), 0),
       0
     );
+    const bals = blocks.reduce((a, b) => a + b.balanceChanges.length, 0);
     console.log(
-      `[firehose] ${start}..${end} -> ${blocks.length} blocks, ${txs} txs, ${itxs} calls in ${Date.now() - started}ms`
+      `[firehose] ${start}..${end} -> ${blocks.length} blocks, ${txs} txs, ${itxs} calls, ` +
+        `${bals} balances in ${Date.now() - started}ms`
     );
     send(200, { blocks });
   } catch (e) {

@@ -103,7 +103,8 @@ defmodule Indexer.Block.Fetcher do
   @type range_data :: %{
           blocks: Blocks.t(),
           receipts: %{logs: [map()], receipts: [map()]} | nil,
-          internal_transactions: [map()] | nil
+          internal_transactions: [map()] | nil,
+          coin_balances: [map()] | nil
         }
 
   @doc """
@@ -290,7 +291,9 @@ defmodule Indexer.Block.Fetcher do
          {:ok, inserted} <-
            __MODULE__.import(
              state,
-             merge_options(basic_import_options, prefetched_options(range_data, blocks, additional_options))
+             basic_import_options
+             |> merge_coin_balances(range_data)
+             |> merge_options(prefetched_options(range_data, blocks, additional_options))
              |> import_options(chain_type_import_options)
              |> extend_with_asyncable_import_options(tokens, token_transfers, address_token_balances, callback_module)
            ) do
@@ -327,7 +330,7 @@ defmodule Indexer.Block.Fetcher do
   @spec fetch_range(t(module()), Range.t()) :: {:ok, range_data()} | {:error, reason :: term()}
   defp fetch_range(%__MODULE__{source: nil, json_rpc_named_arguments: json_rpc_named_arguments}, range) do
     with {:ok, %Blocks{} = blocks} <- EthereumJSONRPC.fetch_blocks_by_range(range, json_rpc_named_arguments) do
-      {:ok, %{blocks: blocks, receipts: nil, internal_transactions: nil}}
+      {:ok, %{blocks: blocks, receipts: nil, internal_transactions: nil, coin_balances: nil}}
     end
   end
 
@@ -368,6 +371,28 @@ defmodule Indexer.Block.Fetcher do
     })
   end
 
+  # The block pipeline emits `%{address_hash, block_number}` placeholders that
+  # `Indexer.Fetcher.CoinBalance` later fills with `eth_getBalance`. A source that already knows the
+  # post-state value replaces the matching placeholder in-place - concatenating instead would put
+  # two rows with the same conflict target in one batch, and which one won would be arbitrary.
+  defp merge_coin_balances(import_options, %{coin_balances: nil}), do: import_options
+  defp merge_coin_balances(import_options, %{coin_balances: []}), do: import_options
+
+  defp merge_coin_balances(import_options, %{coin_balances: coin_balances}) do
+    valued = Map.new(coin_balances, &{{&1.address_hash, &1.block_number}, &1})
+
+    existing =
+      import_options
+      |> get_in([:address_coin_balances, :params])
+      |> Kernel.||([])
+      |> Enum.map(&Map.get(valued, {&1.address_hash, &1.block_number}, &1))
+
+    seen = MapSet.new(existing, &{&1.address_hash, &1.block_number})
+    extra = Enum.reject(coin_balances, &MapSet.member?(seen, {&1.address_hash, &1.block_number}))
+
+    put_in(import_options, [:address_coin_balances, :params], existing ++ extra)
+  end
+
   # `process_massive_blocks/2` defers oversized blocks to the catchup pipeline by dropping them
   # from the fetched data. Prefetched logs and internal transactions have to be dropped alongside
   # them - otherwise they reference transactions that are never imported, and the internal
@@ -375,8 +400,11 @@ defmodule Indexer.Block.Fetcher do
   #
   # Receipts need no filtering: `Receipts.put/2` maps over the surviving transactions and looks
   # receipts up by hash, so extra ones are ignored.
-  defp reject_massive_blocks_data(%{receipts: nil, internal_transactions: nil} = range_data, _filtered_fetched_blocks),
-    do: range_data
+  defp reject_massive_blocks_data(
+         %{receipts: nil, internal_transactions: nil, coin_balances: nil} = range_data,
+         _filtered_fetched_blocks
+       ),
+       do: range_data
 
   defp reject_massive_blocks_data(range_data, %Blocks{blocks_params: blocks_params}) do
     retained_block_numbers = MapSet.new(blocks_params, & &1.number)
@@ -384,7 +412,8 @@ defmodule Indexer.Block.Fetcher do
     %{
       range_data
       | receipts: reject_logs_by_block_number(range_data[:receipts], retained_block_numbers),
-        internal_transactions: reject_by_block_number(range_data[:internal_transactions], retained_block_numbers)
+        internal_transactions: reject_by_block_number(range_data[:internal_transactions], retained_block_numbers),
+        coin_balances: reject_by_block_number(range_data[:coin_balances], retained_block_numbers)
     }
   end
 
@@ -710,7 +739,15 @@ defmodule Indexer.Block.Fetcher do
   end
 
   def async_import_coin_balances(%{address_coin_balances: balances}) do
-    CoinBalanceCatchup.async_fetch_balances(balances)
+    # Balances supplied with a value by the block source are already complete, so there is nothing
+    # for `eth_getBalance` to do. `CoinBalance.stream_unfetched_balances/3` skips them on restart
+    # for the same reason; this keeps the in-process queue consistent with that.
+    #
+    # The runner hands back only `address_hash`/`block_number`/`value`, so the presence of a value
+    # is what has to be tested - `value_fetched_at` is not in the returned map.
+    balances
+    |> Enum.reject(&Map.get(&1, :value))
+    |> CoinBalanceCatchup.async_fetch_balances()
   end
 
   def async_import_coin_balances(_), do: :ok

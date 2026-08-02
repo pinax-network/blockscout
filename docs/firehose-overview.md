@@ -85,17 +85,22 @@ neither is present, and `GET /health` reports which mode is active:
 detection lives. That is deliberate — it is the riskiest part of an explorer and the part least
 worth destabilising.
 
-**Blockscout still needs node access today** for the enrichment fetchers — native balances,
-token balances, and token/NFT metadata — which run `eth_getBalance` and `eth_call`. As implemented,
-this change replaces the block/receipt/trace workload only.
+**Native balances are served from Firehose too.** `balance_changes` is recorded post-state, so
+coin balances arrive already valued and `Indexer.Fetcher.CoinBalance` never issues `eth_getBalance`
+for them. Verified end to end: 300 of 300 balances in Blockscout's own database match
+`eth_getBalance` at the same block exactly.
+
+**Blockscout still needs node access** for token balances and token/NFT metadata, which go through
+`eth_call`.
 
 How much of that residual is *inherently* node-only is a smaller set than it first appears.
 Extended blocks carry `balance_changes`, `code_changes`, `nonce_changes`, `storage_changes` and
 `keccak_preimages`, which between them cover native balances, contract code, nonces, and — via
 storage keys resolved through their keccak preimages — ERC-20 `balanceOf`. Only token and NFT
 metadata genuinely require `eth_call`, and that is one-time per token rather than per block.
-Measured in [firehose-node-dependency.md](firehose-node-dependency.md): ~24 of ~26 recurring node
-calls per block are addressable. **Not implemented** — scoped, not built.
+Measured in [firehose-node-dependency.md](firehose-node-dependency.md). `balanceOf` derivation is
+deliberately **not** implemented: it reaches only 94.2% and the failures are undetectable from
+block data, so it falls back to `eth_call` rather than risk a wrong balance.
 
 **Pending transactions** are not in Firehose, since they are not in blocks.
 
@@ -106,6 +111,7 @@ calls per block are addressable. **Not implemented** — scoped, not built.
 | `apps/ethereum_jsonrpc/lib/ethereum_jsonrpc/firehose.ex` | connector client + response decoding |
 | `apps/indexer/lib/indexer/block/fetcher.ex` | the `:source` seam |
 | `apps/indexer/lib/indexer/block/catchup/fetcher.ex` | skips the async trace pass when traces arrive inline |
+| `dev/firehose/analyze-coverage.js`, `derive-gated.js` | measurement tools behind the node-dependency analysis |
 | `dev/firehose/firehose-sidecar.js` | the connector |
 | `dev/firehose/rpc-sidecar.js` | RPC-backed test double, for running without a Firehose endpoint |
 | `dev/firehose/proto/` | schemas, synced from the Buf Schema Registry |

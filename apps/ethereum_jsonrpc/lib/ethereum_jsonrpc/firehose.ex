@@ -70,7 +70,8 @@ defmodule EthereumJSONRPC.Firehose do
   @type range_data :: %{
           blocks: Blocks.t(),
           receipts: %{logs: [map()], receipts: [map()]} | nil,
-          internal_transactions: [map()] | nil
+          internal_transactions: [map()] | nil,
+          coin_balances: [map()] | nil
         }
 
   @doc """
@@ -94,7 +95,8 @@ defmodule EthereumJSONRPC.Firehose do
        %{
          blocks: to_blocks(entries),
          receipts: to_receipts(entries),
-         internal_transactions: internal_transactions
+         internal_transactions: internal_transactions,
+         coin_balances: to_coin_balances(entries)
        }}
     end
   end
@@ -183,6 +185,28 @@ defmodule EthereumJSONRPC.Firehose do
       end)
 
     Geth.block_traces_to_internal_transactions_params(responses, id_to_params, json_rpc_named_arguments())
+  end
+
+  # Native balances are *recorded* state - the node wrote the post-state value down - so they need
+  # no interpretation and land already fetched. `value_fetched_at` is what keeps
+  # `CoinBalance.stream_unfetched_balances/3` from ever picking them up again.
+  defp to_coin_balances(entries) do
+    fetched_at = DateTime.utc_now()
+
+    Enum.flat_map(entries, fn entry ->
+      block_number = entry_block_number(entry)
+
+      entry
+      |> Map.get("balanceChanges", [])
+      |> Enum.map(fn %{"address" => address, "value" => value} ->
+        %{
+          address_hash: address,
+          block_number: block_number,
+          value: quantity_to_integer(value),
+          value_fetched_at: fetched_at
+        }
+      end)
+    end)
   end
 
   defp entry_block_number(%{"number" => number}) when is_integer(number), do: number
