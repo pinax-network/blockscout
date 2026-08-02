@@ -85,10 +85,17 @@ neither is present, and `GET /health` reports which mode is active:
 detection lives. That is deliberate — it is the riskiest part of an explorer and the part least
 worth destabilising.
 
-**Blockscout still needs an archive node.** Firehose carries state *changes*, not arbitrary state
-*queries*. Token metadata (`name`/`symbol`/`decimals`), `balanceOf`, and contract reads all go
-through `eth_call`, which Firehose cannot answer. This change replaces the history workload, not
-the node.
+**Blockscout still needs node access today** for the enrichment fetchers — native balances,
+token balances, and token/NFT metadata — which run `eth_getBalance` and `eth_call`. As implemented,
+this change replaces the block/receipt/trace workload only.
+
+How much of that residual is *inherently* node-only is a smaller set than it first appears.
+Extended blocks carry `balance_changes`, `code_changes`, `nonce_changes`, `storage_changes` and
+`keccak_preimages`, which between them cover native balances, contract code, nonces, and — via
+storage keys resolved through their keccak preimages — ERC-20 `balanceOf`. Only token and NFT
+metadata genuinely require `eth_call`, and that is one-time per token rather than per block.
+Measured in [firehose-node-dependency.md](firehose-node-dependency.md): ~24 of ~26 recurring node
+calls per block are addressable. **Not implemented** — scoped, not built.
 
 **Pending transactions** are not in Firehose, since they are not in blocks.
 
@@ -103,5 +110,7 @@ the node.
 | `dev/firehose/rpc-sidecar.js` | RPC-backed test double, for running without a Firehose endpoint |
 | `dev/firehose/proto/` | schemas, synced from the Buf Schema Registry |
 
-See [firehose-block-mapping.md](firehose-block-mapping.md) for the field-by-field translation and
-[firehose-parity.md](firehose-parity.md) for how 1:1 parity with RPC is verified.
+See [firehose-block-mapping.md](firehose-block-mapping.md) for the field-by-field translation,
+[firehose-parity.md](firehose-parity.md) for how 1:1 parity with RPC is verified, and
+[firehose-node-dependency.md](firehose-node-dependency.md) for what still needs a node and how much
+of it an extended block could absorb.
