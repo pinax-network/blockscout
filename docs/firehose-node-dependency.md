@@ -70,17 +70,25 @@ storage_change.key -> keccak_preimages[key] -> abi.encode(holder, slot)
 `balanceOf` for, **25.8% resolve** from storage. Over a 1,000-block window the figure is 29.8%.
 This is the number that matters, and it is far below what the mechanism suggests in isolation.
 
-**Accuracy, verified against the node:** each derived balance was checked with an actual
+**Accuracy, verified against the node:** every derived balance was checked with an actual
 `eth_call balanceOf(holder)` at the same block.
 
 ```
-verified 60 derived balances against eth_call balanceOf() at the same block
-  exact match : 59
-  mismatch    : 1   (packed-slot)
-  accuracy    : 98.3%
+verified 599 derived balances against eth_call balanceOf()   (46 tokens)
+  exact match    : 431
+  mismatch       : 168
+     packed slot : 161
+     other       :   7
+  accuracy       : 71.9%
 ```
 
-So the derivation is *reliable where it applies*, but applies to under a third of the need.
+A first pass over 60 samples showed 98.3%; that was a small-sample artifact and did not survive
+widening. **Packed storage slots are common, not exceptional** — 27% of resolved balances share
+their 32-byte word with another field, so reading the whole word gives a number that is wrong by
+orders of magnitude.
+
+Compounding the two figures, the share of `balanceOf` calls that can be replaced *correctly and
+generically* is `25.8% × 71.9%` ≈ **19%**.
 
 `storage_changes` carry `old_value` and `new_value`, so results are **absolute balances**, not
 deltas — no accumulation from genesis required.
@@ -97,11 +105,18 @@ end-of-block state. Take the highest-`ordinal` write per `(block, token, holder)
 holder went `0 → 86843071998124 → 0` inside a single block, and comparing the intermediate write
 against `eth_call` looks like a data error when it is not.
 
+This is only a partial fix, and explains the 7 non-packed mismatches: the last *resolvable* write
+is not always the last *actual* write. If a later write in the same block has no usable preimage,
+a stale intermediate value is kept. Those mismatches are small relative differences
+(e.g. `5074002286930471045` vs `5073938167231311660`) rather than the order-of-magnitude errors
+packing produces.
+
 #### Why the other ~70% does not resolve
 
-- **Packed slots.** The sole verification mismatch was a slot holding more than one field:
-  derived `36893488147419103234`, actual `2` — and `36893488147419103234 & (2⁶⁴−1) == 2`. Reading
-  the whole word as the balance is wrong without knowing the layout.
+- **Packed slots — the dominant failure.** 161 of 168 mismatches. A slot holding more than one
+  field reads back as nonsense: derived `36893488147419103234`, actual `2`, because
+  `36893488147419103234 & (2⁶⁴−1) == 2`. Resolving these needs per-contract layout knowledge,
+  which defeats the point of a generic derivation.
 - **Non-canonical layouts.** ERC-721 keys ownership by token id, not holder; ERC-1155 uses nested
   mappings; some tokens use structs or custom accounting.
 - **No usable preimage.** Only writes whose key resolves to a 64-byte `abi.encode(address, slot)`
@@ -125,19 +140,20 @@ Measured, per block, over 2,000 blocks:
 | Work | Needed/block | Derivable | Residual/block |
 |---|---|---|---|
 | `eth_getBalance` | 13.5 | 100% | 0 |
-| `balanceOf` | 11.0 | 25.8% | 8.2 |
+| `balanceOf` | 11.0 | 25.8% resolve × 71.9% correct ≈ **19%** | 8.9 |
 | `eth_getCode` | sporadic | 100% | 0 |
 | `tokenURI` | 1.9 | 0% | 1.9 |
 | token metadata | one-time/token | 0% | one-time |
 
-**Roughly 60% of the recurring per-block node calls are addressable**, dominated by native
-balances. The residual is ~10 calls/block, mostly `balanceOf` for holders whose storage layout
-cannot be resolved generically.
+**Roughly 59% of the recurring per-block node calls are addressable — and essentially all of that
+is `eth_getBalance`.** `balanceOf` derivation contributes about 2 of the ~26 calls/block once both
+coverage and correctness are applied, and buying those 2 costs per-contract storage-layout
+knowledge. On this evidence it is not worth building generically; native balances, contract code
+and nonces are.
 
-That is a real reduction but **not** node elimination, and materially less than a first look at
-`storage_changes` suggests. The honest positioning: Firehose removes the *expensive* calls
-(`debug_traceBlockByNumber`, which many providers do not expose) outright, and can remove the
-single most frequent cheap one (`eth_getBalance`). It does not remove the need for `eth_call`.
+That is a real reduction but **not** node elimination. The honest positioning: Firehose removes the
+*expensive* calls (`debug_traceBlockByNumber`, which many providers do not expose) outright, and
+removes the most frequent cheap one (`eth_getBalance`). It does not meaningfully reduce `eth_call`.
 
 None of the balance/code/nonce derivation is implemented. It is scoped here because it changes
 what the integration is worth, and because the measurement is cheap to redo on another chain —
