@@ -3,12 +3,16 @@
 Replacing block/receipt/trace fetching removes the *heaviest* node calls, but not the *most
 numerous*. This measures what is left and how much of it an extended block could serve.
 
-All figures are from Robinhood Chain, blocks 25899000–25899499 (500 blocks, 3,640 transactions),
-indexed via Firehose.
+All figures are from Robinhood Chain: 2,000 blocks (25899000–25900999, 16,283 transactions) for
+the payload and coverage measurements, and 1,000 blocks for the sample verified against `eth_call`.
+Reproduce with `dev/firehose/analyze-coverage.js`.
 
 ## The residual load
 
 Blockscout's enrichment fetchers issue one call per row of work discovered while importing blocks:
+
+Rows below are what Blockscout actually recorded indexing 500 blocks; each row is one call its
+enrichment fetchers would issue.
 
 | Work | Rows over 500 blocks | Per block | RPC method |
 |---|---|---|---|
@@ -28,17 +32,16 @@ Both framings matter: Firehose removes the expensive calls, not the frequent one
 
 ## What an extended block already contains
 
-Measured per Robinhood block, from `sf.ethereum.type.v2`:
+Measured over 2,000 Robinhood blocks, from `sf.ethereum.type.v2`:
 
-| Field | Per block |
-|---|---|
-| `balance_changes` | 47.5 |
-| `storage_changes` | 93.1 |
-| `keccak_preimages` | 122.8 |
-| `gas_changes` | 231.4 |
-| `nonce_changes` | 8.5 |
-| `code_changes` | on deployment |
-| `account_creations` | on creation |
+| Field | Total | Per block |
+|---|---|---|
+| `keccak_preimages` | 255,034 | 127.5 |
+| `storage_changes` | 162,142 | 81.1 |
+| `balance_changes` | 79,229 | 39.6 |
+| `nonce_changes` | 14,871 | 7.4 |
+| `account_creations` | 519 | 0.3 |
+| `code_changes` | 300 | 0.2 |
 
 ### Directly replaceable
 
@@ -48,9 +51,10 @@ Measured per Robinhood block, from `sf.ethereum.type.v2`:
 | `eth_getCode` | `code_changes` on the deploying call |
 | nonce lookups | `nonce_changes` |
 
-That covers the single largest line item (15.2 calls/block) outright.
+That covers the single largest line item — native balances, 12–15 calls/block — outright, and
+contract code and nonces with it.
 
-### Derivable, with work: `balanceOf`
+### Partly derivable: `balanceOf` — ~30%, and exact when it resolves
 
 An ERC-20 balance lives at `keccak256(abi.encode(holder, slot))`. Firehose records the storage
 write *and* the keccak preimage that produced the key, so the holder and mapping slot can be
@@ -62,28 +66,48 @@ storage_change.key -> keccak_preimages[key] -> abi.encode(holder, slot)
                                           bytes 12..32     bytes 32..64
 ```
 
-**Verified on live Robinhood data.** Resolving storage changes on transactions carrying ERC-20
-`Transfer` logs against the holders named in those logs:
+**Coverage, measured over 2,000 blocks:** of 21,995 `(token, holder)` pairs Blockscout would issue
+`balanceOf` for, **25.8% resolve** from storage. Over a 1,000-block window the figure is 29.8%.
+This is the number that matters, and it is far below what the mechanism suggests in isolation.
+
+**Accuracy, verified against the node:** each derived balance was checked with an actual
+`eth_call balanceOf(holder)` at the same block.
 
 ```
-token 0xc6b81b429797e0f555  holder 0x760a4e1016bae903ca  mapping slot 51
-   balance 189588857555763671 -> 189565235526820016   (delta -23622028943655)
-token 0xc6b81b429797e0f555  holder 0xcaf681a66d02060134  mapping slot 51
-   balance                 0 ->      23622028943655   (delta +23622028943655)
+verified 60 derived balances against eth_call balanceOf() at the same block
+  exact match : 59
+  mismatch    : 1   (packed-slot)
+  accuracy    : 98.3%
 ```
 
-Both sides of one transfer, reconstructed from storage alone. `storage_changes` carries
-`old_value` and `new_value`, so these are **absolute balances**, not deltas — no accumulation from
-genesis required.
+So the derivation is *reliable where it applies*, but applies to under a third of the need.
 
-Caveats:
+`storage_changes` carry `old_value` and `new_value`, so results are **absolute balances**, not
+deltas — no accumulation from genesis required.
 
-- Only holders whose balance *changed* in the indexed window appear. A holder who has been idle
-  since before the window still needs one `eth_call` to seed.
-- Not every storage change is a balance. In the sample, 189 of 700 resolved to a known transfer
-  participant; the rest are allowances and unrelated state. Attribution has to be filtered, not
-  assumed.
-- Proxy and non-standard token implementations will not all follow the canonical mapping layout.
+#### Two things this got wrong first, worth repeating
+
+**Storage attribution.** `StorageChange` has its **own `address` field**, and it is not the call's
+`address`. Under `DELEGATECALL` — i.e. every proxy-pattern token — storage belongs to the caller
+while `call.address` is the implementation. Attributing to the call raised the miss rate by nine
+percentage points (16.5% → 25.8% once corrected).
+
+**Intra-block ordering.** A balance can be written several times in one block; `eth_call` returns
+end-of-block state. Take the highest-`ordinal` write per `(block, token, holder)`. One observed
+holder went `0 → 86843071998124 → 0` inside a single block, and comparing the intermediate write
+against `eth_call` looks like a data error when it is not.
+
+#### Why the other ~70% does not resolve
+
+- **Packed slots.** The sole verification mismatch was a slot holding more than one field:
+  derived `36893488147419103234`, actual `2` — and `36893488147419103234 & (2⁶⁴−1) == 2`. Reading
+  the whole word as the balance is wrong without knowing the layout.
+- **Non-canonical layouts.** ERC-721 keys ownership by token id, not holder; ERC-1155 uses nested
+  mappings; some tokens use structs or custom accounting.
+- **No usable preimage.** Only writes whose key resolves to a 64-byte `abi.encode(address, slot)`
+  preimage can be attributed at all.
+- **Idle holders.** Only balances that *changed* in the window appear. Seeding a holder untouched
+  since before the window still needs one `eth_call`.
 
 ### Not derivable
 
@@ -96,20 +120,25 @@ The saving grace is that they are **one-time per token** rather than per block: 
 
 ## Conclusion
 
-The earlier framing — "Firehose replaces the history workload, not the node" — is too pessimistic.
-A more accurate split:
+Measured, per block, over 2,000 blocks:
 
-| | |
-|---|---|
-| **Replaced today** | blocks, receipts, logs, traces |
-| **Replaceable, not yet built** | native balances, contract code, nonces (direct); token balances (via storage + preimages) |
-| **Still needs `eth_call`** | token and NFT metadata — one-time per token, not per block |
+| Work | Needed/block | Derivable | Residual/block |
+|---|---|---|---|
+| `eth_getBalance` | 13.5 | 100% | 0 |
+| `balanceOf` | 11.0 | 25.8% | 8.2 |
+| `eth_getCode` | sporadic | 100% | 0 |
+| `tokenURI` | 1.9 | 0% | 1.9 |
+| token metadata | one-time/token | 0% | one-time |
 
-Roughly **24 of the ~26 recurring node calls per block are addressable**, leaving a small
-one-time-per-token tail. That would take Blockscout from "needs a full archive node alongside
-Firehose" to "needs occasional `eth_call` access" — a materially different operational story,
-since `eth_call` is available on essentially every RPC provider while `debug_traceBlockByNumber`
-is not.
+**Roughly 60% of the recurring per-block node calls are addressable**, dominated by native
+balances. The residual is ~10 calls/block, mostly `balanceOf` for holders whose storage layout
+cannot be resolved generically.
 
-None of this is implemented. It is scoped here because it changes what the integration is worth,
-and because the measurement is cheap to redo on another chain.
+That is a real reduction but **not** node elimination, and materially less than a first look at
+`storage_changes` suggests. The honest positioning: Firehose removes the *expensive* calls
+(`debug_traceBlockByNumber`, which many providers do not expose) outright, and can remove the
+single most frequent cheap one (`eth_getBalance`). It does not remove the need for `eth_call`.
+
+None of the balance/code/nonce derivation is implemented. It is scoped here because it changes
+what the integration is worth, and because the measurement is cheap to redo on another chain —
+coverage is a property of the token contracts on that chain, not of Firehose.
