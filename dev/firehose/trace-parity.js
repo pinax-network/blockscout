@@ -8,8 +8,7 @@ const assert = require("node:assert/strict");
 const { flattenTrace } = require("./firehose-sidecar");
 
 const RPC_URL = process.env.RPC_URL || process.env.ETHEREUM_JSONRPC_TRACE_URL;
-const SIDECAR_URL =
-  process.env.FIREHOSE_URL || process.env.INDEXER_FIREHOSE_URL || "http://127.0.0.1:8082/v1/blocks";
+const SIDECAR_URL = "http://127.0.0.1:8082/v1/blocks";
 
 function quantity(value) {
   if (!value || value === "0x") return "0x0";

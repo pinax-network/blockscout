@@ -10,14 +10,13 @@
 //   POST /v1/blocks  {"start_block": 1, "end_block": 10}
 //   -> {"blocks": [{"number", "block", "receipts", "traces"}, ...]}
 //
-// Usage - see .env.example for the full set:
-//   FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> PORT=8082 node firehose-sidecar.js
+// Usage:
+//   FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> node firehose-sidecar.js
 
 const http = require("http");
 const path = require("path");
 const fs = require("fs");
 const cluster = require("cluster");
-const os = require("os");
 const grpc = require("@grpc/grpc-js");
 const protoLoader = require("@grpc/proto-loader");
 const protobuf = require("protobufjs");
@@ -36,17 +35,20 @@ const protobuf = require("protobufjs");
   }
 })();
 
-const ENDPOINT = process.env.FIREHOSE_ENDPOINT || "localhost:10015";
-const PORT = parseInt(process.env.PORT || "8081", 10);
-const PLAINTEXT = process.env.FIREHOSE_PLAINTEXT === "true";
-const CHAIN_FAMILY = process.env.FIREHOSE_CHAIN_FAMILY || "arbitrum";
+const ENDPOINT = process.env.FIREHOSE_ENDPOINT || "";
+const PORT = 8082;
+const WORKERS = 8;
 const SUPPORTED_CHAIN_FAMILIES = new Set(["arbitrum", "ethereum"]);
 
-// Firehose providers authenticate in one of two ways. Pinax and StreamingFast's hosted endpoints
-// take a long-lived key in `x-api-key`; deployments fronted by StreamingFast's auth service take a
-// short-lived JWT in `authorization: bearer <token>`. Set whichever your provider issues.
-const API_KEY = process.env.FIREHOSE_API_KEY || process.env.PINAX_KEY || "";
-const BEARER_TOKEN = process.env.FIREHOSE_BEARER_TOKEN || "";
+// Reuse Blockscout's native chain selection instead of introducing a Firehose-specific setting.
+// The default Blockscout build follows Ethereum semantics; unsupported chain families fail closed.
+function chainFamilyForChainType(chainType) {
+  if (!chainType || chainType === "default" || chainType === "ethereum") return "ethereum";
+  return chainType;
+}
+
+const CHAIN_FAMILY = chainFamilyForChainType(process.env.CHAIN_TYPE);
+const API_KEY = process.env.FIREHOSE_API_KEY || "";
 
 const PROTO_OPTS = {
   keepCase: false,
@@ -73,21 +75,17 @@ ethRoot.loadSync("sf/ethereum/type/v2/type.proto", { keepCase: false });
 const EthBlock = ethRoot.lookupType("sf.ethereum.type.v2.Block");
 
 function makeClient() {
-  const creds = PLAINTEXT
-    ? grpc.credentials.createInsecure()
-    : grpc.credentials.createSsl();
-  return new firehosePkg.sf.firehose.v2.Stream(ENDPOINT, creds, {
+  return new firehosePkg.sf.firehose.v2.Stream(ENDPOINT, grpc.credentials.createSsl(), {
     "grpc.max_receive_message_length": 50 * 1024 * 1024,
     "grpc.keepalive_time_ms": 30000,
   });
 }
 
-const client = makeClient();
+const client = ENDPOINT ? makeClient() : null;
 
 function metadata() {
   const md = new grpc.Metadata();
   if (API_KEY) md.set("x-api-key", API_KEY);
-  if (BEARER_TOKEN) md.set("authorization", `bearer ${BEARER_TOKEN}`);
   return md;
 }
 
@@ -496,7 +494,7 @@ function typeNumber(type) {
 function validateBlockFamily(block, chainFamily = CHAIN_FAMILY) {
   if (!SUPPORTED_CHAIN_FAMILIES.has(chainFamily)) {
     throw new Error(
-      `unsupported FIREHOSE_CHAIN_FAMILY ${chainFamily}; supported values are arbitrum and ethereum`
+      `unsupported CHAIN_TYPE ${chainFamily}; Firehose supports arbitrum and ethereum`
     );
   }
 
@@ -511,7 +509,7 @@ function validateBlockFamily(block, chainFamily = CHAIN_FAMILY) {
   if (familySpecific) {
     throw new Error(
       `transaction ${hex(familySpecific.hash)} has ${familySpecific.type}, which is not supported for ` +
-        `FIREHOSE_CHAIN_FAMILY=${chainFamily}`
+        `CHAIN_TYPE=${chainFamily}`
     );
   }
 
@@ -522,7 +520,7 @@ function validateBlockFamily(block, chainFamily = CHAIN_FAMILY) {
   ) {
     throw new Error(
       `block ${block.number} has system calls but no Arbitrum internal transaction; ` +
-        `check FIREHOSE_CHAIN_FAMILY`
+        `check CHAIN_TYPE`
     );
   }
 }
@@ -566,7 +564,7 @@ function fetchRange(startBlock, endBlock) {
         return reject(
           new Error(
             `firehose auth rejected (${e.details || e.message}). ` +
-              `Set FIREHOSE_API_KEY (or FIREHOSE_BEARER_TOKEN) - see dev/firehose/.env.example`
+              `Set FIREHOSE_API_KEY - see dev/firehose/.env.example`
           )
         );
       }
@@ -628,7 +626,7 @@ const server = http.createServer(async (req, res) => {
       endpoint: ENDPOINT,
       source: "firehose",
       chainFamily: CHAIN_FAMILY,
-      auth: API_KEY ? "api-key" : BEARER_TOKEN ? "bearer" : "none",
+      auth: API_KEY ? "api-key" : "none",
     });
   }
   if (req.method !== "POST") return send(405, { error: "method not allowed" });
@@ -696,24 +694,13 @@ function flattenTrace(frame, traceAddress = [], out = []) {
   return out;
 }
 
-// Decoding protobuf and re-encoding it as JSON is CPU-bound, and it pins one core: with a single
-// process the sidecar tops out around 16 blocks/s no matter how many ranges Blockscout requests
-// concurrently, which makes it - not Firehose - the bottleneck. Fork one worker per core and let
-// the kernel spread the accepted connections across them.
-const WORKERS = parseInt(process.env.FIREHOSE_WORKERS || String(Math.max(1, os.cpus().length - 2)), 10);
-
 function start() {
+  if (!ENDPOINT) throw new Error("FIREHOSE_ENDPOINT is required");
+  if (!API_KEY) throw new Error("FIREHOSE_API_KEY is required");
+
   if (!SUPPORTED_CHAIN_FAMILIES.has(CHAIN_FAMILY)) {
     throw new Error(
-      `unsupported FIREHOSE_CHAIN_FAMILY ${CHAIN_FAMILY}; supported values are arbitrum and ethereum`
-    );
-  }
-
-  if (cluster.isPrimary && !API_KEY && !BEARER_TOKEN) {
-    console.warn(
-      `[firehose] WARNING: neither FIREHOSE_API_KEY nor FIREHOSE_BEARER_TOKEN is set - requests to ` +
-        `${ENDPOINT} will be sent unauthenticated and will most likely be rejected. ` +
-        `See dev/firehose/.env.example`
+      `unsupported CHAIN_TYPE ${CHAIN_FAMILY}; Firehose supports arbitrum and ethereum`
     );
   }
 
@@ -727,7 +714,7 @@ function start() {
       }
     });
   } else {
-    server.listen(PORT, () =>
+    server.listen(PORT, "127.0.0.1", () =>
       console.log(`[firehose] worker ${process.pid} listening on :${PORT}, streaming from ${ENDPOINT}`)
     );
   }
@@ -736,6 +723,7 @@ function start() {
 if (require.main === module) start();
 
 module.exports = {
+  chainFamilyForChainType,
   coinBalances,
   convertBlock,
   flattenTrace,

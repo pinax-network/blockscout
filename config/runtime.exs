@@ -286,12 +286,20 @@ config :ethereum_jsonrpc, EthereumJSONRPC.HTTP,
   gzip_enabled?: ConfigHelper.parse_bool_env_var("ETHEREUM_JSONRPC_HTTP_GZIP_ENABLED", "false"),
   batch_size: ConfigHelper.parse_integer_env_var("ETHEREUM_JSONRPC_HTTP_BATCH_SIZE", 500)
 
-firehose_url = ConfigHelper.parse_url_env_var("INDEXER_FIREHOSE_URL")
-firehose_timeout = ConfigHelper.parse_time_env_var("INDEXER_FIREHOSE_TIMEOUT", "60s")
+firehose_endpoint = System.get_env("FIREHOSE_ENDPOINT")
+firehose_api_key = System.get_env("FIREHOSE_API_KEY")
 
+if firehose_endpoint in [nil, ""] != firehose_api_key in [nil, ""] do
+  raise "FIREHOSE_ENDPOINT and FIREHOSE_API_KEY must be configured together"
+end
+
+firehose_url =
+  if firehose_endpoint in [nil, ""], do: nil, else: "http://127.0.0.1:8082/v1/blocks"
+
+# Firehose runs as a co-located sidecar with fixed internal networking and timeout settings.
 config :ethereum_jsonrpc, EthereumJSONRPC.Firehose,
   url: firehose_url,
-  http_options: [pool: :ethereum_jsonrpc, recv_timeout: firehose_timeout, timeout: firehose_timeout]
+  http_options: [pool: :ethereum_jsonrpc, recv_timeout: 60_000, timeout: 60_000]
 
 config :ethereum_jsonrpc, EthereumJSONRPC.Geth,
   block_traceable?: ConfigHelper.parse_bool_env_var("ETHEREUM_JSONRPC_GETH_TRACE_BY_BLOCK"),
@@ -1301,10 +1309,7 @@ config :indexer, Indexer.Block.Catchup.MissingRangesCollector,
 
 config :indexer, Indexer.Block.Catchup.Fetcher,
   batch_size: ConfigHelper.parse_integer_env_var("INDEXER_CATCHUP_BLOCKS_BATCH_SIZE", 10),
-  concurrency: ConfigHelper.parse_integer_env_var("INDEXER_CATCHUP_BLOCKS_CONCURRENCY", 10),
-  range_claiming_enabled?: ConfigHelper.parse_bool_env_var("INDEXER_CATCHUP_BLOCKS_RANGE_CLAIMING_ENABLED", "false"),
-  range_claim_lease_duration:
-    ConfigHelper.parse_time_env_var("INDEXER_CATCHUP_BLOCKS_RANGE_CLAIM_LEASE_DURATION", "10m")
+  concurrency: ConfigHelper.parse_integer_env_var("INDEXER_CATCHUP_BLOCKS_CONCURRENCY", 10)
 
 config :indexer, Indexer.Fetcher.BlockReward,
   batch_size: ConfigHelper.parse_integer_env_var("INDEXER_BLOCK_REWARD_BATCH_SIZE", 10),

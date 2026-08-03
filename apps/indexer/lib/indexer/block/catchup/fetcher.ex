@@ -53,8 +53,8 @@ defmodule Indexer.Block.Catchup.Fetcher do
     Logger.metadata(fetcher: :block_catchup)
     Process.flag(:trap_exit, true)
 
-    case get_missing_ranges_batch() do
-      {[], _claim_id} ->
+    case MissingBlockRange.get_latest_batch(blocks_batch_size() * blocks_concurrency()) do
+      [] ->
         %{
           first_block_number: nil,
           last_block_number: nil,
@@ -62,7 +62,7 @@ defmodule Indexer.Block.Catchup.Fetcher do
           shrunk: false
         }
 
-      {missing_ranges, claim_id} ->
+      missing_ranges ->
         first.._//_ = List.first(missing_ranges)
         _..last//_ = List.last(missing_ranges)
 
@@ -73,11 +73,7 @@ defmodule Indexer.Block.Catchup.Fetcher do
           |> Stream.map(&Enum.count/1)
           |> Enum.sum()
 
-        try do
-          stream_fetch_and_import(state, missing_ranges, claim_id)
-        after
-          maybe_release_claim(claim_id)
-        end
+        stream_fetch_and_import(state, missing_ranges)
 
         %{
           first_block_number: first,
@@ -107,31 +103,6 @@ defmodule Indexer.Block.Catchup.Fetcher do
   """
   def blocks_concurrency do
     Application.get_env(:indexer, __MODULE__)[:concurrency]
-  end
-
-  defp get_missing_ranges_batch do
-    size = blocks_batch_size() * blocks_concurrency()
-
-    if range_claiming_enabled?() do
-      case MissingBlockRange.claim_latest_batch(size, range_claim_lease_duration()) do
-        {:ok, %{id: claim_id, ranges: ranges}} -> {ranges, claim_id}
-        {:error, reason} -> raise "failed to claim missing block ranges: #{inspect(reason)}"
-      end
-    else
-      {MissingBlockRange.get_latest_batch(size), nil}
-    end
-  end
-
-  defp range_claiming_enabled? do
-    Application.get_env(:indexer, __MODULE__)
-    |> Keyword.get(:range_claiming_enabled?, false)
-  end
-
-  defp range_claim_lease_duration do
-    :indexer
-    |> Application.get_env(__MODULE__)
-    |> Keyword.get(:range_claim_lease_duration, :timer.minutes(10))
-    |> max(:timer.seconds(3))
   end
 
   @async_import_remaining_block_data_options ~w(address_hash_to_fetched_balance_block_number)a
@@ -196,18 +167,16 @@ defmodule Indexer.Block.Catchup.Fetcher do
   defp maybe_async_import_internal_transactions(imported, _options, realtime?),
     do: async_import_internal_transactions(imported, realtime?)
 
-  defp stream_fetch_and_import(state, ranges, claim_id) do
-    with_claim_renewal(claim_id, fn ->
-      TaskSupervisor
-      |> Task.Supervisor.async_stream(
-        RangesHelper.split(ranges, blocks_batch_size()),
-        &fetch_and_import_missing_range(state, &1, claim_id),
-        max_concurrency: blocks_concurrency(),
-        timeout: :infinity,
-        shutdown: Application.get_env(:indexer, :graceful_shutdown_period)
-      )
-      |> handle_fetch_and_import_results(claim_id)
-    end)
+  defp stream_fetch_and_import(state, ranges) do
+    TaskSupervisor
+    |> Task.Supervisor.async_stream(
+      RangesHelper.split(ranges, blocks_batch_size()),
+      &fetch_and_import_missing_range(state, &1),
+      max_concurrency: blocks_concurrency(),
+      timeout: :infinity,
+      shutdown: Application.get_env(:indexer, :graceful_shutdown_period)
+    )
+    |> handle_fetch_and_import_results()
   end
 
   # Run at state.blocks_concurrency max_concurrency when called by `stream_import/1`
@@ -218,8 +187,7 @@ defmodule Indexer.Block.Catchup.Fetcher do
             )
   defp fetch_and_import_missing_range(
          %__MODULE__{block_fetcher: %Block.Fetcher{} = block_fetcher},
-         first..last//_ = range,
-         claim_id
+         first..last//_ = range
        ) do
     Logger.metadata(fetcher: :block_catchup, first_block_number: first, last_block_number: last)
     Process.flag(:trap_exit, true)
@@ -239,15 +207,14 @@ defmodule Indexer.Block.Catchup.Fetcher do
         Prometheus.Instrumenter.set_import_errors_count()
         Logger.error(fn -> ["failed to validate: ", inspect(changesets), ". Retrying."] end, step: step)
 
-        tagged_error(error, range, false)
+        error
 
       {:error, {:import = step, reason}} = error ->
         Prometheus.Instrumenter.set_import_errors_count()
         Logger.error(fn -> [inspect(reason), ". Retrying."] end, step: step)
-        massive? = reason == :timeout
-        if massive?, do: maybe_add_range_to_massive_blocks(range, claim_id)
+        if reason == :timeout, do: add_range_to_massive_blocks(range)
 
-        tagged_error(error, range, massive?)
+        error
 
       {:error, {step, reason}} = error ->
         Logger.error(
@@ -257,7 +224,7 @@ defmodule Indexer.Block.Catchup.Fetcher do
           step: step
         )
 
-        tagged_error(error, range, false)
+        error
 
       {:error, {step, failed_value, _changes_so_far}} = error ->
         Logger.error(
@@ -267,109 +234,27 @@ defmodule Indexer.Block.Catchup.Fetcher do
           step: step
         )
 
-        tagged_error(error, range, false)
+        error
     end
   rescue
     exception ->
-      massive? = timeout_exception?(exception)
-      if massive?, do: maybe_add_range_to_massive_blocks(range, claim_id)
+      if timeout_exception?(exception), do: add_range_to_massive_blocks(range)
       Logger.error(fn -> [Exception.format(:error, exception, __STACKTRACE__), ?\n, ?\n, "Retrying."] end)
-      tagged_error({:error, exception}, range, massive?)
+      {:error, exception}
   end
 
-  defp handle_fetch_and_import_results(results, claim_id) do
+  defp handle_fetch_and_import_results(results) do
     results
-    |> Enum.reduce({[], []}, fn
-      {:ok, {:ok, %{range: range, errors: errors}}}, {successful_numbers, massive_numbers} ->
-        range_successful_numbers = Enum.to_list(range) -- Enum.map(errors, &block_error_to_number/1)
-        {range_successful_numbers ++ successful_numbers, massive_numbers}
-
-      {:ok, {:error, %{massive?: true, range: range}}}, {success_numbers, massive_numbers} ->
-        {success_numbers, Enum.to_list(range) ++ massive_numbers}
+    |> Enum.reduce([], fn
+      {:ok, {:ok, %{range: range, errors: errors}}}, acc ->
+        success_numbers = Enum.to_list(range) -- Enum.map(errors, &block_error_to_number/1)
+        success_numbers ++ acc
 
       _result, acc ->
         acc
     end)
-    |> settle_fetch_and_import_results(claim_id)
-  end
-
-  defp settle_fetch_and_import_results({successful_numbers, _massive_numbers}, nil) do
-    successful_numbers
     |> numbers_to_ranges()
     |> MissingBlockRange.clear_batch()
-  end
-
-  defp settle_fetch_and_import_results({successful_numbers, massive_numbers}, claim_id) do
-    completed_numbers = successful_numbers ++ massive_numbers
-
-    case MissingBlockRange.complete_claim(claim_id, completed_numbers) do
-      {:ok, owned_completed_numbers} ->
-        owned_completed_numbers
-        |> Enum.filter(&(&1 in massive_numbers))
-        |> MassiveBlock.insert_block_numbers()
-
-      {:error, reason} ->
-        raise "failed to complete missing block range claim: #{inspect(reason)}"
-    end
-  end
-
-  defp tagged_error(error, range, massive?) do
-    {:error, %{error: error, massive?: massive?, range: range}}
-  end
-
-  defp maybe_add_range_to_massive_blocks(range, nil), do: add_range_to_massive_blocks(range)
-  defp maybe_add_range_to_massive_blocks(_range, _claim_id), do: :ok
-
-  defp maybe_release_claim(nil), do: :ok
-
-  defp maybe_release_claim(claim_id) do
-    case MissingBlockRange.release_claim(claim_id) do
-      {:ok, _released_numbers} -> :ok
-      {:error, reason} -> Logger.error("Failed to release missing block range claim: #{inspect(reason)}")
-    end
-  end
-
-  defp with_claim_renewal(nil, function), do: function.()
-
-  defp with_claim_renewal(claim_id, function) do
-    parent = self()
-    stop_ref = make_ref()
-    lease_duration = range_claim_lease_duration()
-
-    renewal_pid =
-      spawn(fn ->
-        parent_ref = Process.monitor(parent)
-        renew_claim_loop(parent_ref, stop_ref, claim_id, lease_duration)
-      end)
-
-    try do
-      function.()
-    after
-      send(renewal_pid, {:stop, stop_ref})
-    end
-  end
-
-  defp renew_claim_loop(parent_ref, stop_ref, claim_id, lease_duration) do
-    receive do
-      {:stop, ^stop_ref} ->
-        :ok
-
-      {:DOWN, ^parent_ref, :process, _pid, _reason} ->
-        :ok
-    after
-      div(lease_duration, 3) ->
-        case MissingBlockRange.renew_claim(claim_id, lease_duration) do
-          {0, nil} ->
-            Logger.warning("Missing block range claim lease was lost before catchup completed")
-
-          {_renewed_count, nil} ->
-            renew_claim_loop(parent_ref, stop_ref, claim_id, lease_duration)
-        end
-    end
-  rescue
-    exception ->
-      Logger.error("Failed to renew missing block range claim: #{Exception.message(exception)}")
-      renew_claim_loop(parent_ref, stop_ref, claim_id, lease_duration)
   end
 
   defp handle_null_rounds(errors) do

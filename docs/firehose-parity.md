@@ -102,8 +102,8 @@ and pins a single core:
 | 1 worker, 5 concurrent requests | 15.8 (**0.99x** — no gain) |
 | 8 workers, 8 concurrent requests | ~90 (**5.7x**) |
 
-A single-process connector caps the whole pipeline no matter how many ranges Blockscout requests
-concurrently. Run at least one worker per two cores.
+The production connector therefore uses the measured eight-worker configuration rather than
+exposing another tuning variable.
 
 Interpretation caveats, both of which understate the Firehose advantage:
 
@@ -116,19 +116,21 @@ Interpretation caveats, both of which understate the Firehose advantage:
 ## Reproducing
 
 ```bash
-# connector
+# connector (fixed at eight workers on 127.0.0.1:8082)
 cd dev/firehose && npm ci
-FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> PORT=8082 FIREHOSE_WORKERS=8 \
-  node firehose-sidecar.js
+export FIREHOSE_ENDPOINT="<host>:443"
+export FIREHOSE_API_KEY="<key>"
+node firehose-sidecar.js
 
 # baseline
-export ETHEREUM_JSONRPC_HTTP_URL=<archive-rpc>
-export ETHEREUM_JSONRPC_TRACE_URL=<archive-rpc>
-unset INDEXER_FIREHOSE_URL
+export ETHEREUM_JSONRPC_HTTP_URL="<archive-rpc>"
+export ETHEREUM_JSONRPC_TRACE_URL="<archive-rpc>"
+unset FIREHOSE_ENDPOINT
 mix run --no-halt
 
 # firehose, same range, wiped database
-export INDEXER_FIREHOSE_URL=http://127.0.0.1:8082
+export FIREHOSE_ENDPOINT="<host>:443"
+export FIREHOSE_API_KEY="<key>"
 mix run --no-halt
 ```
 
@@ -139,8 +141,7 @@ Run the strict frame-level comparison independently:
 
 ```bash
 cd dev/firehose
-RPC_URL=<archive-rpc> FIREHOSE_URL=http://127.0.0.1:8082/v1/blocks \
-  START_BLOCK=<first> END_BLOCK=<last> npm run verify:traces
+RPC_URL="<archive-rpc>" START_BLOCK="<first>" END_BLOCK="<last>" npm run verify:traces
 ```
 
 ## Open items

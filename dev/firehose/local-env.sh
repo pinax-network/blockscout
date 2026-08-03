@@ -2,8 +2,8 @@
 #
 #   source dev/firehose/local-env.sh
 #
-# Set INDEXER_FIREHOSE_URL to route backfill through the Firehose connector; leave it unset for
-# stock JSON-RPC behaviour. Nothing here is a real credential - override for your own environment.
+# Set FIREHOSE_ENDPOINT and FIREHOSE_API_KEY in the shared Blockscout/sidecar environment to route
+# backfill through Firehose. Leave FIREHOSE_ENDPOINT unset for stock JSON-RPC behaviour.
 
 export MIX_ENV=${MIX_ENV:-dev}
 
@@ -33,6 +33,3 @@ export INDEXER_DISABLE_CATALOGED_TOKEN_UPDATER_FETCHER=true
 export BLOCK_RANGES="${BLOCK_RANGES:-1..1000}"
 export INDEXER_CATCHUP_BLOCKS_BATCH_SIZE="${INDEXER_CATCHUP_BLOCKS_BATCH_SIZE:-10}"
 export INDEXER_CATCHUP_BLOCKS_CONCURRENCY="${INDEXER_CATCHUP_BLOCKS_CONCURRENCY:-10}"
-
-# export INDEXER_FIREHOSE_URL="http://127.0.0.1:8082"
-# export INDEXER_FIREHOSE_TIMEOUT="120s"

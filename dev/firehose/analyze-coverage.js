@@ -14,7 +14,7 @@ const protoLoader = require("@grpc/proto-loader");
 const protobuf = require("protobufjs");
 
 const ENDPOINT = process.env.FIREHOSE_ENDPOINT;
-const API_KEY = process.env.FIREHOSE_API_KEY || process.env.PINAX_KEY || "";
+const API_KEY = process.env.FIREHOSE_API_KEY || "";
 const START = parseInt(process.argv[2], 10);
 const COUNT = parseInt(process.argv[3], 10);
 const OUT = process.argv[4];

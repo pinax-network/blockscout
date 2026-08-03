@@ -2,12 +2,21 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const {
+  chainFamilyForChainType,
   coinBalances,
   convertBlock,
   flattenTrace,
   validateBlockFamily,
   validateFetchedRange,
 } = require("./firehose-sidecar");
+
+test("chain family reuses Blockscout's native chain type", () => {
+  assert.equal(chainFamilyForChainType(undefined), "ethereum");
+  assert.equal(chainFamilyForChainType("default"), "ethereum");
+  assert.equal(chainFamilyForChainType("ethereum"), "ethereum");
+  assert.equal(chainFamilyForChainType("arbitrum"), "arbitrum");
+  assert.equal(chainFamilyForChainType("optimism"), "optimism");
+});
 const { compareBlockTraces } = require("./trace-parity");
 
 const address = (lastByte) => Buffer.from("00".repeat(19) + lastByte.toString(16).padStart(2, "0"), "hex");
@@ -237,11 +246,11 @@ test("validateBlockFamily keeps unverified chain families fail-closed", () => {
   );
   assert.throws(
     () => validateBlockFamily(firehoseBlock(transactionTrace("TRX_TYPE_ARBITRUM_INTERNAL")), "ethereum"),
-    /not supported for FIREHOSE_CHAIN_FAMILY=ethereum/
+    /not supported for CHAIN_TYPE=ethereum/
   );
   assert.throws(
     () => validateBlockFamily(firehoseBlock(transactionTrace("TRX_TYPE_OPTIMISM_DEPOSIT")), "optimism"),
-    /unsupported FIREHOSE_CHAIN_FAMILY optimism/
+    /unsupported CHAIN_TYPE optimism/
   );
 });
 

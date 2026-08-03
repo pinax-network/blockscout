@@ -7,25 +7,26 @@
 Blockscout's catchup (backfill) pipeline normally rebuilds each block range from three passes
 against a JSON-RPC node: `eth_getBlockByNumber`, `eth_getBlockReceipts`, and a deferred
 `debug_traceBlockByNumber` per block driven off `pending_block_operations`. With
-`INDEXER_FIREHOSE_URL` set, catchup instead gets blocks, receipts, logs and call traces from a
-Firehose-backed sidecar in one request per range, and imports the internal transactions in the
+`FIREHOSE_ENDPOINT` set, catchup instead gets blocks, receipts, logs and call traces from a
+co-located Firehose sidecar in one request per range, and imports the internal transactions in the
 same database transaction as the blocks.
 
 Realtime is unaffected — it keeps following the head over JSON-RPC, where its reorg detection lives.
 
 ## Configuration
 
+Only two Firehose-specific variables are required:
+
 | Variable | Meaning |
 |---|---|
-| `INDEXER_FIREHOSE_URL` | Sidecar endpoint. Unset (default) = stock JSON-RPC behaviour. |
-| `INDEXER_FIREHOSE_TIMEOUT` | Request timeout, default `60s`. |
-| `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIMING_ENABLED` | Set `true` on every catchup replica to partition backfill; default `false`. |
-| `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIM_LEASE_DURATION` | Crash-recovery lease, renewed while work is active; default `10m`. |
+| `FIREHOSE_ENDPOINT` | TLS Firehose gRPC endpoint in `host:port` form; setting it enables Firehose catchup. |
+| `FIREHOSE_API_KEY` | API key sent as `x-api-key` metadata. |
 
-The sidecar also requires a mapping policy. `FIREHOSE_CHAIN_FAMILY` defaults to `arbitrum` for the
-original Orbit deployment. Set it to `ethereum` explicitly for experimental Cancun/Prague support.
-Optimism and Polygon currently fail closed because their end-to-end database parity is not
-certified and the protobuf lacks the complete Optimism deposit payload.
+The connector is fixed at eight workers on `127.0.0.1:8082`, and Blockscout uses a 60-second
+request timeout. Chain mapping reuses Blockscout's native `CHAIN_TYPE`: `arbitrum` uses the verified
+Orbit policy, while `ethereum` and the default build use the experimental Cancun/Prague mapping.
+Optimism and Polygon fail closed because their end-to-end database parity is not certified and the
+protobuf lacks the complete Optimism deposit payload.
 
 ## Sidecar contract
 
@@ -75,33 +76,24 @@ version.
 
 ```bash
 cd dev/firehose && npm ci
-cp .env.example .env    # then fill in FIREHOSE_ENDPOINT and your auth
+export FIREHOSE_ENDPOINT="<host>:443"
+export FIREHOSE_API_KEY="<key>"
 node firehose-sidecar.js
 ```
 
-Blockscout parallelizes catchup inside one indexer instance. Increase
-`INDEXER_CATCHUP_BLOCKS_CONCURRENCY` alongside `FIREHOSE_WORKERS`; the defaults are 10 concurrent
-ranges and `cores - 2` sidecar processes.
-
-To add catchup-enabled indexer replicas against the same database, set
-`INDEXER_CATCHUP_BLOCKS_RANGE_CLAIMING_ENABLED=true` on all of them. The replicas then lease
-disjoint ranges and renew their leases until import finishes. A crashed replica's work is available
-again after `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIM_LEASE_DURATION` (default `10m`). Do not mix this with
-legacy catchup replicas, because a legacy replica does not claim its work. The feature coordinates
-both JSON-RPC and Firehose catchup; Firehose throughput still also depends on `FIREHOSE_WORKERS` and
-the connector, upstream, and database capacity.
+Run one catchup-enabled Blockscout indexer. Scale it with Blockscout's native
+`INDEXER_CATCHUP_BLOCKS_BATCH_SIZE` and `INDEXER_CATCHUP_BLOCKS_CONCURRENCY`; both default to `10`.
+Increase them gradually until the fixed eight-worker connector, Firehose upstream, or database
+becomes the bottleneck. Multiple catchup-enabled indexers sharing one database are not supported.
 
 Or pass them inline:
 
 ```bash
-FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> FIREHOSE_CHAIN_FAMILY=arbitrum \
-  PORT=8082 FIREHOSE_WORKERS=8 \
-  node firehose-sidecar.js
+FIREHOSE_ENDPOINT="<host>:443" FIREHOSE_API_KEY="<key>" node firehose-sidecar.js
 ```
 
-Firehose endpoints require auth — set `FIREHOSE_API_KEY` (sent as `x-api-key`) or
-`FIREHOSE_BEARER_TOKEN` (sent as `authorization: bearer`). `GET /health` reports which is active.
-`.env` is gitignored; never commit a key.
+`GET /health` reports the selected native chain family and API-key authentication. `.env` is
+gitignored; never commit a key.
 
 ## Known fidelity gaps vs a node's callTracer
 
@@ -120,8 +112,7 @@ The parity command compares every call frame by transaction and derived trace ad
 `type`, `from`, `to`, `value`, `gas`, `gasUsed`, `input`, `output`, and `error`:
 
 ```bash
-RPC_URL=<archive-rpc> FIREHOSE_URL=http://127.0.0.1:8082/v1/blocks \
-  START_BLOCK=25899000 END_BLOCK=25899099 npm run verify:traces
+RPC_URL="<archive-rpc>" START_BLOCK=25899000 END_BLOCK=25899099 npm run verify:traces
 ```
 
 A frame-count match alone is not accepted as parity.
@@ -136,12 +127,13 @@ docker run -d --name fh-db -e POSTGRES_DB=blockscout -e POSTGRES_USER=blockscout
   -e POSTGRES_PASSWORD=blockscout -p 7432:5432 --shm-size=256m postgres:17
 docker run -d --name fh-redis -p 6379:6379 redis:7
 
-# connector (RPC-backed test double - no Firehose endpoint needed)
-RPC_URL=http://127.0.0.1:8545 PORT=8081 node dev/firehose/rpc-sidecar.js &
+# connector (RPC-backed test double - no real Firehose endpoint needed)
+RPC_URL=http://127.0.0.1:8545 PORT=8082 node dev/firehose/rpc-sidecar.js &
 
 # indexer
 source dev/firehose/local-env.sh
-export BLOCK_RANGES="1..70" INDEXER_FIREHOSE_URL="http://127.0.0.1:8081"
+export BLOCK_RANGES="1..70" FIREHOSE_ENDPOINT="rpc-test-double"
+export FIREHOSE_API_KEY="local-test-only"
 mix ecto.create && mix ecto.migrate
 mix run --no-halt
 ```
@@ -149,5 +141,5 @@ mix run --no-halt
 Then `psql ... -f dev/firehose/verify.sql`. `pending_block_operations` should be `0` — the traces
 were imported inline rather than queued for the node's tracer.
 
-To compare against stock behaviour, truncate the chain tables, unset `INDEXER_FIREHOSE_URL`, re-run,
+To compare against stock behaviour, truncate the chain tables, unset `FIREHOSE_ENDPOINT`, re-run,
 and check the fingerprints match.
