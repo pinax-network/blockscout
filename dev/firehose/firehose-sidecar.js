@@ -392,14 +392,14 @@ function convertBlock(block, chainFamily = CHAIN_FAMILY) {
 
   // Block-level system calls are not attached to any TransactionTrace. Arbitrum exposes them
   // through callTracer under its ArbOS internal transaction, so attach by transaction type rather
-  // than assuming index 0. Ethereum's Cancun/Prague protocol calls have no transaction and are not
-  // returned by debug_traceBlockByNumber, so they deliberately remain outside `callTraces`.
+  // than assuming the first trace is the system transaction. A block can contain multiple ArbOS
+  // internal transactions; its node tracer attaches the block-level calls to index 0. Ethereum's
+  // Cancun/Prague protocol calls have no transaction and are not returned by
+  // debug_traceBlockByNumber, so they deliberately remain outside `callTraces`.
   const systemFrame = buildCallTree(block.systemCalls);
   const systemTransactions = traces.filter(isSystemTransaction);
-  if (systemFrame && systemTransactions.length > 1) {
-    throw new Error(`block ${number} has multiple Arbitrum system transactions`);
-  }
-  const systemTransaction = systemTransactions[0];
+  const systemTransaction =
+    systemTransactions.find((transaction) => Number(transaction.index) === 0) || systemTransactions[0];
 
   const callTraces = traces.map((t) => {
     const result = buildCallTree(t.calls);
@@ -454,6 +454,10 @@ function convertBlock(block, chainFamily = CHAIN_FAMILY) {
     receipts,
     traces: callTraces,
     balanceChanges: coinBalances(block),
+    // Robinhood blocks with multiple ArbOS internal transactions currently carry a Firehose call
+    // hierarchy for the later transaction that differs from debug_traceBlockByNumber. Preserve
+    // the fast block/receipt path but let Blockscout fetch traces from its native RPC source.
+    traceFallback: systemTransactions.length > 1,
   };
 }
 
@@ -579,8 +583,7 @@ function fetchRange(startBlock, endBlock) {
     });
     stream.on("end", () => {
       try {
-        validateFetchedRange(out, startBlock, endBlock);
-        resolve(out);
+        resolve(validateFetchedRange(out, startBlock, endBlock));
       } catch (e) {
         reject(e);
       }
@@ -590,8 +593,11 @@ function fetchRange(startBlock, endBlock) {
 
 function validateFetchedRange(blocks, startBlock, endBlock) {
   const expected = endBlock - startBlock + 1;
+  // Firehose can transiently include already-final boundary blocks outside the requested range.
+  // They must not be imported, but they also do not make an otherwise complete response invalid.
+  const inRange = blocks.filter((block) => block.number >= startBlock && block.number <= endBlock);
   const counts = new Map();
-  for (const block of blocks) counts.set(block.number, (counts.get(block.number) || 0) + 1);
+  for (const block of inRange) counts.set(block.number, (counts.get(block.number) || 0) + 1);
 
   const missing = [];
   for (let number = startBlock; number <= endBlock; number++) {
@@ -602,17 +608,23 @@ function validateFetchedRange(blocks, startBlock, endBlock) {
     .filter(([, count]) => count > 1)
     .map(([number]) => number)
     .sort((a, b) => a - b);
-  const unexpected = [...counts.keys()]
-    .filter((number) => number < startBlock || number > endBlock)
-    .sort((a, b) => a - b);
+  const unexpected = [
+    ...new Set(
+      blocks
+        .map((block) => block.number)
+        .filter((number) => number < startBlock || number > endBlock)
+    ),
+  ].sort((a, b) => a - b);
 
-  if (blocks.length !== expected || missing.length || duplicates.length || unexpected.length) {
+  if (inRange.length !== expected || missing.length || duplicates.length) {
     throw new Error(
       `incomplete firehose range ${startBlock}..${endBlock}: ` +
         `missing=${JSON.stringify(missing)} duplicates=${JSON.stringify(duplicates)} ` +
         `unexpected=${JSON.stringify(unexpected)}`
     );
   }
+
+  return inRange;
 }
 
 // ---------------------------------------------------------------- http server

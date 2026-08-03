@@ -150,8 +150,11 @@ test("coinBalances keeps only persistent root changes from failed transactions",
   assert.deepEqual(balances, [{ address: "0x" + "00".repeat(19) + "02", value: "0x9" }]);
 });
 
-test("validateFetchedRange rejects incomplete, duplicate, and unexpected responses", () => {
-  assert.doesNotThrow(() => validateFetchedRange([{ number: 10 }, { number: 11 }], 10, 11));
+test("validateFetchedRange ignores boundary blocks but rejects incomplete and duplicate requested blocks", () => {
+  assert.deepEqual(
+    validateFetchedRange([{ number: 9 }, { number: 10 }, { number: 11 }, { number: 12 }], 10, 11),
+    [{ number: 10 }, { number: 11 }]
+  );
   assert.throws(
     () => validateFetchedRange([{ number: 9 }, { number: 10 }, { number: 10 }], 10, 11),
     /missing=\[11\].*duplicates=\[10\].*unexpected=\[9\]/
@@ -297,6 +300,38 @@ test("system calls attach to an Arbitrum internal transaction by type, not posit
   assert.equal(arbitrum.traces[0].result.calls.length, 1);
   assert.equal(arbitrum.traces[0].result.calls[0].from, `0x${address(8).toString("hex")}`);
   assert.equal(ethereum.traces[0].result.calls, undefined);
+});
+
+test("system calls attach to the index-0 transaction when a block has multiple Arbitrum internals", () => {
+  const systemCall = {
+    index: 1,
+    parentIndex: 0,
+    callType: "CALL",
+    caller: address(8),
+    address: address(9),
+    value: bigInt(0),
+    gasLimit: 1_000,
+    gasConsumed: 500,
+  };
+  const laterInternal = transactionTrace("TRX_TYPE_ARBITRUM_INTERNAL", {
+    hash: data(0x12),
+    index: 1,
+  });
+  const indexZeroInternal = transactionTrace("TRX_TYPE_ARBITRUM_INTERNAL", {
+    hash: data(0x13),
+    index: 0,
+  });
+  const converted = convertBlock(
+    firehoseBlock(laterInternal, {
+      transactionTraces: [laterInternal, indexZeroInternal],
+      systemCalls: [systemCall],
+    })
+  );
+
+  assert.equal(converted.traces[0].result.calls, undefined);
+  assert.equal(converted.traces[1].result.calls.length, 1);
+  assert.equal(converted.traces[1].result.calls[0].from, `0x${address(8).toString("hex")}`);
+  assert.equal(converted.traceFallback, true);
 });
 
 test("flattenTrace compares full frames at their derived trace addresses", () => {

@@ -150,6 +150,14 @@ defmodule EthereumJSONRPC.FirehoseTest do
       assert to_string(nested.to_address_hash) == @recipient
     end
 
+    test "defers traces to native JSON-RPC when the sidecar requests a fallback" do
+      fallback_entry = Map.put(entry(64), "traceFallback", true)
+      stub_sidecar([fallback_entry])
+
+      assert {:ok, %{blocks: %Blocks{blocks_params: [_]}, receipts: %{receipts: [_]}, internal_transactions: nil}} =
+               Firehose.fetch_range(64..64)
+    end
+
     test "asks the sidecar for an ascending span when the range descends" do
       # the catchup fetcher walks backwards, so it hands down ranges like 70..61
       stub_sidecar(Enum.map(61..70, &entry/1))

@@ -44,6 +44,9 @@ defmodule EthereumJSONRPC.Firehose do
     * `"receipts"` must contain a receipt for *every* transaction in `"block"`.
       `Indexer.Block.Fetcher.Receipts.put/2` looks receipts up by transaction hash with
       `Map.fetch!/2` and will raise on a missing one.
+    * `"traceFallback": true` asks the indexer to use its native JSON-RPC trace fetcher for the
+      whole range. Blocks and receipts still use Firehose, while `pending_block_operations` keeps
+      trace completion durable.
     * `"blocks"` may be returned in any order and may omit blocks outside the requested range,
       but every requested block number should appear exactly once.
 
@@ -326,15 +329,19 @@ defmodule EthereumJSONRPC.Firehose do
   end
 
   defp to_internal_transactions(entries) do
-    {responses, id_to_params} =
-      entries
-      |> Enum.with_index()
-      |> Enum.reduce({[], %{}}, fn {entry, id}, {responses, id_to_params} ->
-        {[%{id: id, result: Map.fetch!(entry, "traces")} | responses],
-         Map.put(id_to_params, id, entry_block_number(entry))}
-      end)
+    if Enum.any?(entries, &(Map.get(&1, "traceFallback", false) == true)) do
+      {:ok, nil}
+    else
+      {responses, id_to_params} =
+        entries
+        |> Enum.with_index()
+        |> Enum.reduce({[], %{}}, fn {entry, id}, {responses, id_to_params} ->
+          {[%{id: id, result: Map.fetch!(entry, "traces")} | responses],
+           Map.put(id_to_params, id, entry_block_number(entry))}
+        end)
 
-    Geth.block_traces_to_internal_transactions_params(responses, id_to_params, json_rpc_named_arguments())
+      Geth.block_traces_to_internal_transactions_params(responses, id_to_params, json_rpc_named_arguments())
+    end
   end
 
   # Native balances are *recorded* state - the node wrote the post-state value down - so they need
