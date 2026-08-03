@@ -458,7 +458,9 @@ defmodule BlockScoutWeb.Account.API.V2.AuthenticateControllerTest do
         |> get("/api/account/v2/siwe_message?address=#{address.hash}")
         |> json_response(200)
 
-      assert String.contains?(response["siwe_message"], Address.checksum(address))
+      assert response["siwe_message"]
+             |> String.downcase()
+             |> String.contains?(address |> Address.checksum() |> String.downcase())
     end
 
     test "return error for an invalid address", %{conn: conn} do
