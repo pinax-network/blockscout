@@ -606,6 +606,7 @@
         "returnaddress",
         "retval",
         "reuseaddr",
+        "robinhood",
         "rollup",
         "rollups",
         "rotr",

@@ -149,6 +149,10 @@ RPC_URL="<archive-rpc>" START_BLOCK="<first>" END_BLOCK="<last>" npm run verify:
 - **CREATE2** is recorded as `:create`. `sf.ethereum.type.v2.CallType` has no `CREATE2` member.
 - **Zero-value selfdestruct beneficiaries** are unrecoverable — no balance moved, so Firehose
   records no refund to attribute.
-- End-to-end parity is verified on **Arbitrum Orbit**. Ethereum Cancun/Prague field mapping has
-  fixture coverage but still requires a recorded RPC-vs-Firehose database comparison before a
-  deployment is certified. Optimism and Polygon remain fail-closed and unsupported.
+- **Robinhood Arbitrum type-2 fee caps** are absent from the extended Firehose payload. The
+  connector retains effective `gasPrice` but cannot reconstruct the original cap; tracked in
+  [issue #4](https://github.com/pinax-network/blockscout/issues/4).
+- Block, receipt, trace, and native-balance parity is verified on **Arbitrum Orbit**, subject to
+  the fee-cap source gap above. Ethereum Cancun/Prague field mapping has fixture coverage but still
+  requires a recorded RPC-vs-Firehose database comparison before a deployment is certified.
+  Optimism and Polygon remain fail-closed and unsupported.
