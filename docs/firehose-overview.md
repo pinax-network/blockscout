@@ -58,6 +58,8 @@ The trade is JSON transcoding cost, which is real and is the connector's through
 |---|---|
 | `INDEXER_FIREHOSE_URL` | Connector endpoint. Unset = stock JSON-RPC behaviour. |
 | `INDEXER_FIREHOSE_TIMEOUT` | Request timeout, default `60s`. Raise for large ranges. |
+| `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIMING_ENABLED` | Atomically partition catchup across replicas; default `false`. Enable on every catchup replica sharing the database. |
+| `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIM_LEASE_DURATION` | Recoverable claim lease; default `10m`. It is renewed while a batch is active. |
 
 Connector-side — see [`dev/firehose/.env.example`](../dev/firehose/.env.example). A `.env` file
 next to the connector is read automatically; real environment variables take precedence.
@@ -88,16 +90,23 @@ One Blockscout indexer already runs catchup ranges concurrently. The main contro
 |---|---|
 | `INDEXER_CATCHUP_BLOCKS_CONCURRENCY` | Concurrent range requests from Blockscout; default `10` |
 | `INDEXER_CATCHUP_BLOCKS_BATCH_SIZE` | Blocks per range request; default `10` |
+| `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIMING_ENABLED` | Partition missing ranges across indexer replicas; default `false` |
+| `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIM_LEASE_DURATION` | Time before work from a crashed replica can be recovered; default `10m` |
 | `FIREHOSE_WORKERS` | CPU-parallel sidecar processes |
 
 Raise sidecar workers and Blockscout concurrency together until the sidecar CPU, Firehose upstream,
 or database becomes the bottleneck. Larger batches amortise stream setup, but also increase memory,
 response size, and the chance that a range exceeds `INDEXER_FIREHOSE_TIMEOUT`.
 
-Do not scale catchup by starting several indexer replicas against the same database. The current
-`missing_block_ranges` reader does not claim or lease work: each replica can select the same newest
-ranges, producing duplicate Firehose streams and duplicate import attempts rather than useful
-horizontal speedup. True multi-instance backfill needs an atomic range-claim mechanism.
+Horizontal catchup is opt-in. Set `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIMING_ENABLED=true` on **every**
+catchup-enabled indexer replica that shares the database. Each replica atomically splits and leases
+disjoint rows from `missing_block_ranges` with `FOR UPDATE SKIP LOCKED`. Active leases are renewed;
+after a crash, the expired rows become claimable by another replica. Successful blocks are removed
+only when the completing worker still owns the claim, while failed blocks are released for retry.
+
+Do not mix claiming and legacy catchup replicas. A legacy replica does not acquire ownership before
+fetching, so it can still duplicate another replica's work. Keep the feature disabled for the
+standard single-indexer deployment; its read, fetch and clear path remains unchanged.
 
 ## Scope and limits
 

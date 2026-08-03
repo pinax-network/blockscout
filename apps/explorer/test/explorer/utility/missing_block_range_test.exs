@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: LicenseRef-Blockscout
 defmodule Explorer.Utility.MissingBlockRangeTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
-  alias Explorer.Utility.MissingBlockRange
+  import Ecto.Query
+
   alias Explorer.Repo
+  alias Explorer.Utility.MissingBlockRange
 
   describe "add_ranges_by_block_numbers/2" do
     setup do
@@ -480,6 +482,146 @@ defmodule Explorer.Utility.MissingBlockRangeTest do
       assert Enum.any?(ranges, fn range ->
                range.from_number == 34 and range.to_number == 31 and range.priority == 1
              end)
+    end
+  end
+
+  describe "claim_latest_batch/2" do
+    setup do
+      Repo.delete_all(MissingBlockRange)
+
+      on_exit(fn -> Repo.delete_all(MissingBlockRange) end)
+
+      :ok
+    end
+
+    test "preserves priority ordering and atomically splits a partial range" do
+      Repo.insert!(%MissingBlockRange{from_number: 200, to_number: 101})
+      Repo.insert!(%MissingBlockRange{from_number: 50, to_number: 1, priority: 1})
+
+      assert {:ok, %{id: claim_id, ranges: [50..21//-1]}} = MissingBlockRange.claim_latest_batch(30, 60_000)
+
+      assert %MissingBlockRange{
+               from_number: 50,
+               to_number: 21,
+               priority: 1,
+               claim_id: ^claim_id,
+               claim_expires_at: %DateTime{}
+             } = Repo.get_by!(MissingBlockRange, from_number: 50)
+
+      assert %MissingBlockRange{from_number: 20, to_number: 1, priority: 1, claim_id: nil} =
+               Repo.get_by!(MissingBlockRange, from_number: 20)
+
+      assert %MissingBlockRange{from_number: 200, to_number: 101, claim_id: nil} =
+               Repo.get_by!(MissingBlockRange, from_number: 200)
+    end
+
+    test "two concurrent claimers receive disjoint block numbers" do
+      Repo.insert!(%MissingBlockRange{from_number: 200, to_number: 101})
+      Repo.insert!(%MissingBlockRange{from_number: 100, to_number: 1})
+
+      parent = self()
+
+      claimers =
+        for _index <- 1..2 do
+          Task.async(fn ->
+            send(parent, {:ready, self()})
+
+            receive do
+              :claim -> MissingBlockRange.claim_latest_batch(100, 60_000)
+            end
+          end)
+        end
+
+      Enum.each(claimers, fn %Task{pid: pid} ->
+        assert_receive {:ready, ^pid}
+      end)
+
+      Enum.each(claimers, &send(&1.pid, :claim))
+
+      claimed_number_sets =
+        Enum.map(claimers, fn claimer ->
+          assert {:ok, %{ranges: ranges}} = Task.await(claimer)
+          ranges |> Enum.flat_map(&Enum.to_list/1) |> MapSet.new()
+        end)
+
+      assert [first, second] = claimed_number_sets
+      assert MapSet.disjoint?(first, second)
+      assert MapSet.size(first) == 100
+      assert MapSet.size(second) == 100
+    end
+
+    test "an expired claim can be recovered and fences the stale worker" do
+      Repo.insert!(%MissingBlockRange{from_number: 20, to_number: 1})
+
+      assert {:ok, %{id: stale_claim_id, ranges: [20..1//-1]}} =
+               MissingBlockRange.claim_latest_batch(20, 10)
+
+      Process.sleep(20)
+
+      assert {:ok, %{id: recovered_claim_id, ranges: [20..1//-1]}} =
+               MissingBlockRange.claim_latest_batch(20, 60_000)
+
+      refute stale_claim_id == recovered_claim_id
+      assert {:ok, []} = MissingBlockRange.complete_claim(stale_claim_id, Enum.to_list(20..1//-1))
+
+      assert %MissingBlockRange{claim_id: ^recovered_claim_id} = Repo.one!(MissingBlockRange)
+    end
+
+    test "completes owned successes and releases failures with their priority" do
+      Repo.insert!(%MissingBlockRange{from_number: 20, to_number: 1, priority: 1})
+
+      assert {:ok, %{id: claim_id, ranges: [20..11//-1]}} = MissingBlockRange.claim_latest_batch(10, 60_000)
+      assert {:ok, [20, 19, 17]} = MissingBlockRange.complete_claim(claim_id, [20, 19, 17, 999])
+
+      missing_numbers =
+        MissingBlockRange
+        |> Repo.all()
+        |> Enum.flat_map(fn range -> Enum.to_list(range.from_number..range.to_number//-1) end)
+        |> Enum.sort(:desc)
+
+      expected_missing_numbers = Enum.to_list(18..1//-1) -- [17]
+
+      assert missing_numbers == expected_missing_numbers
+      refute Repo.exists?(from(range in MissingBlockRange, where: not is_nil(range.claim_id)))
+      assert Enum.all?(Repo.all(MissingBlockRange), &(&1.priority == 1))
+    end
+
+    test "renewing a claim prevents recovery" do
+      Repo.insert!(%MissingBlockRange{from_number: 10, to_number: 1})
+
+      assert {:ok, %{id: claim_id, ranges: [10..1//-1]}} = MissingBlockRange.claim_latest_batch(10, 20)
+      Process.sleep(10)
+      assert {1, nil} = MissingBlockRange.renew_claim(claim_id, 60_000)
+      Process.sleep(15)
+
+      assert {:ok, %{ranges: []}} = MissingBlockRange.claim_latest_batch(10, 60_000)
+      assert %MissingBlockRange{claim_id: ^claim_id} = Repo.one!(MissingBlockRange)
+    end
+
+    test "priority updates preserve an active claim" do
+      Repo.insert!(%MissingBlockRange{from_number: 20, to_number: 1})
+
+      assert {:ok, %{id: claim_id, ranges: [20..11//-1]}} = MissingBlockRange.claim_latest_batch(10, 60_000)
+
+      MissingBlockRange.add_ranges_by_block_numbers([15], 1)
+
+      assert %MissingBlockRange{from_number: 20, to_number: 11, priority: 1, claim_id: ^claim_id} =
+               Repo.get_by!(MissingBlockRange, from_number: 20)
+    end
+
+    test "ordinary range clearing preserves ownership of claimed remainders" do
+      Repo.insert!(%MissingBlockRange{from_number: 20, to_number: 1})
+
+      assert {:ok, %{id: claim_id, ranges: [20..1//-1]}} = MissingBlockRange.claim_latest_batch(20, 60_000)
+
+      MissingBlockRange.clear_batch([18..17//-1])
+
+      claimed_ranges = Repo.all(from(range in MissingBlockRange, order_by: [desc: range.from_number]))
+
+      assert [
+               %MissingBlockRange{from_number: 20, to_number: 19, claim_id: ^claim_id},
+               %MissingBlockRange{from_number: 16, to_number: 1, claim_id: ^claim_id}
+             ] = claimed_ranges
     end
   end
 end

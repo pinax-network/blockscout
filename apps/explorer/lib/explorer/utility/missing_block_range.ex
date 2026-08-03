@@ -34,11 +34,13 @@ defmodule Explorer.Utility.MissingBlockRange do
     # ```
 
     field(:priority, :integer)
+    field(:claim_id, Ecto.UUID)
+    field(:claim_expires_at, :utc_datetime_usec)
   end
 
   @doc false
   def changeset(range \\ %__MODULE__{}, params) do
-    cast(range, params, [:from_number, :to_number, :priority])
+    cast(range, params, [:from_number, :to_number, :priority, :claim_id, :claim_expires_at])
   end
 
   @doc """
@@ -93,6 +95,90 @@ defmodule Explorer.Utility.MissingBlockRange do
     |> elem(1)
     |> Enum.reverse()
   end
+
+  @typedoc "A recoverable lease over disjoint missing block ranges."
+  @type claim :: %{id: Ecto.UUID.t(), ranges: [Range.t()]}
+
+  @doc """
+  Atomically claims the latest missing block ranges for one catchup worker.
+
+  Concurrent callers lock different rows with `FOR UPDATE SKIP LOCKED`. A partial row is split in
+  the same transaction that records the claim, so no block can be returned to two active claims.
+  Expired rows are eligible for a new claim, which recovers work after an indexer crash.
+  """
+  @spec claim_latest_batch(pos_integer(), pos_integer()) :: {:ok, claim()} | {:error, term()}
+  def claim_latest_batch(size, lease_duration)
+      when is_integer(size) and size > 0 and is_integer(lease_duration) and lease_duration > 0 do
+    Repo.transaction(fn ->
+      claim_id = Ecto.UUID.generate()
+      now = database_now()
+      claim_expires_at = DateTime.add(now, lease_duration, :millisecond)
+
+      ranges = claim_ranges(size, claim_id, claim_expires_at, now, [])
+
+      %{id: claim_id, ranges: ranges}
+    end)
+  end
+
+  @doc """
+  Extends a claim lease using the database clock.
+
+  Returns the number of range rows still owned by the claim. A result of zero means that the lease
+  expired and another worker recovered it, or that the claim was already completed.
+  """
+  @spec renew_claim(Ecto.UUID.t(), pos_integer()) :: {non_neg_integer(), nil}
+  def renew_claim(claim_id, lease_duration)
+      when is_binary(claim_id) and is_integer(lease_duration) and lease_duration > 0 do
+    claim_expires_at = DateTime.add(database_now(), lease_duration, :millisecond)
+
+    __MODULE__
+    |> where([range], range.claim_id == ^claim_id)
+    |> Repo.update_all(set: [claim_expires_at: claim_expires_at])
+  end
+
+  @doc """
+  Completes the successful block numbers in a claim and releases the remainder for retry.
+
+  Claim ownership is checked under a row lock. A worker whose lease was recovered cannot clear the
+  new owner's work. The returned numbers are the successful numbers the caller still owned.
+  """
+  @spec complete_claim(Ecto.UUID.t(), [Block.block_number()]) ::
+          {:ok, [Block.block_number()]} | {:error, term()}
+  def complete_claim(claim_id, successful_numbers) when is_binary(claim_id) and is_list(successful_numbers) do
+    successful_numbers_set = MapSet.new(successful_numbers)
+
+    Repo.transaction(fn ->
+      claimed_ranges =
+        __MODULE__
+        |> where([range], range.claim_id == ^claim_id)
+        |> order_by([range], desc: range.from_number)
+        |> lock("FOR UPDATE")
+        |> Repo.all()
+
+      __MODULE__
+      |> where([range], range.claim_id == ^claim_id)
+      |> Repo.delete_all()
+
+      claimed_ranges
+      |> Enum.reduce([], fn range, completed_numbers ->
+        {completed, retry} =
+          range.from_number
+          |> Range.new(range.to_number, -1)
+          |> Enum.split_with(&MapSet.member?(successful_numbers_set, &1))
+
+        retry
+        |> numbers_to_ranges()
+        |> Enum.each(&save_released_range!(&1, range.priority))
+
+        completed ++ completed_numbers
+      end)
+      |> Enum.sort(:desc)
+    end)
+  end
+
+  @doc "Releases every range still owned by a claim for immediate retry."
+  @spec release_claim(Ecto.UUID.t()) :: {:ok, [Block.block_number()]} | {:error, term()}
+  def release_claim(claim_id), do: complete_claim(claim_id, [])
 
   @doc """
   Adds ranges derived from a list of block numbers and saves them with a given priority.
@@ -162,10 +248,11 @@ defmodule Explorer.Utility.MissingBlockRange do
 
     Repo.transaction(fn ->
       {all_ranges, lower_range, higher_range} = lock_related_ranges(max_number, min_number)
+      promote_claimed_ranges(all_ranges, priority)
 
       case {lower_range, higher_range} do
         {%__MODULE__{} = same_range, %__MODULE__{} = same_range} ->
-          if is_nil(same_range.priority) && not is_nil(priority) do
+          if unclaimed?(same_range) && is_nil(same_range.priority) && not is_nil(priority) do
             Repo.delete(same_range)
 
             inside_range_params = %{from_number: max_number, to_number: min_number, priority: priority}
@@ -244,7 +331,7 @@ defmodule Explorer.Utility.MissingBlockRange do
 
   @spec delete_less_priority_range(__MODULE__.t(), integer() | nil) :: any()
   defp delete_less_priority_range(range, priority) do
-    if is_nil(range.priority) && not is_nil(priority) do
+    if unclaimed?(range) && is_nil(range.priority) && not is_nil(priority) do
       delete_range(range.from_number..range.to_number)
     end
   end
@@ -252,7 +339,7 @@ defmodule Explorer.Utility.MissingBlockRange do
   @spec split_left_range_priorities(__MODULE__.t(), integer() | nil, Block.block_number()) ::
           {:ok, t()} | {:error, Ecto.Changeset.t()}
   defp split_left_range_priorities(range, priority, pivot_number) do
-    if is_nil(range.priority) && not is_nil(priority) do
+    if unclaimed?(range) && is_nil(range.priority) && not is_nil(priority) do
       insert_inside_left_range_params(range, pivot_number, priority)
       insert_outside_left_range_params(range, pivot_number)
     end
@@ -261,7 +348,7 @@ defmodule Explorer.Utility.MissingBlockRange do
   @spec split_right_range_priorities(__MODULE__.t(), integer() | nil, Block.block_number()) ::
           {:ok, t()} | {:error, Ecto.Changeset.t()}
   defp split_right_range_priorities(range, priority, pivot_number) do
-    if is_nil(range.priority) && not is_nil(priority) do
+    if unclaimed?(range) && is_nil(range.priority) && not is_nil(priority) do
       insert_inside_right_range_params(range, pivot_number, priority)
       insert_outside_right_range_params(range, pivot_number)
     end
@@ -279,19 +366,23 @@ defmodule Explorer.Utility.MissingBlockRange do
           Repo.delete(same_range)
 
           if same_range.from_number > max_number do
-            insert_range(%{
-              from_number: same_range.from_number,
-              to_number: BlockNumberHelper.next_block_number(max_number),
-              priority: same_range.priority
-            })
+            insert_range(
+              inherit_claim(same_range, %{
+                from_number: same_range.from_number,
+                to_number: BlockNumberHelper.next_block_number(max_number),
+                priority: same_range.priority
+              })
+            )
           end
 
           if same_range.to_number < min_number do
-            insert_range(%{
-              from_number: BlockNumberHelper.previous_block_number(min_number),
-              to_number: same_range.to_number,
-              priority: same_range.priority
-            })
+            insert_range(
+              inherit_claim(same_range, %{
+                from_number: BlockNumberHelper.previous_block_number(min_number),
+                to_number: same_range.to_number,
+                priority: same_range.priority
+              })
+            )
           end
 
         {%__MODULE__{} = range, nil} ->
@@ -436,6 +527,14 @@ defmodule Explorer.Utility.MissingBlockRange do
     |> Repo.one()
   end
 
+  defp get_unclaimed_range_by_block_number(number, priority) do
+    number
+    |> include_bound_query()
+    |> where([range], is_nil(range.claim_id))
+    |> priority_query(priority)
+    |> Repo.one()
+  end
+
   # Fills all missing block ranges that overlap with the interval [from, to]
   @spec fill_ranges_between([__MODULE__.t()], Block.block_number(), Block.block_number(), integer() | nil) :: :ok
   defp fill_ranges_between(all_ranges, from, to, priority) when from >= to do
@@ -524,8 +623,8 @@ defmodule Explorer.Utility.MissingBlockRange do
   defp fill_ranges_between(_all_ranges, _from, _to, _priority), do: :ok
 
   defp insert_or_update_adjacent_ranges(from, to, priority, :both) do
-    upper_range = get_range_by_block_number(from + 1, priority)
-    lower_range = get_range_by_block_number(to - 1, priority)
+    upper_range = get_unclaimed_range_by_block_number(from + 1, priority)
+    lower_range = get_unclaimed_range_by_block_number(to - 1, priority)
 
     case {lower_range, upper_range} do
       {nil, nil} ->
@@ -546,8 +645,8 @@ defmodule Explorer.Utility.MissingBlockRange do
   defp insert_or_update_adjacent_ranges(from, to, priority, direction) do
     {range, update_params} =
       case direction do
-        :up -> {get_range_by_block_number(from + 1, priority), %{to_number: to}}
-        :down -> {get_range_by_block_number(to - 1, priority), %{from_number: from}}
+        :up -> {get_unclaimed_range_by_block_number(from + 1, priority), %{to_number: to}}
+        :down -> {get_unclaimed_range_by_block_number(to - 1, priority), %{from_number: from}}
       end
 
     if is_nil(range) do
@@ -563,8 +662,27 @@ defmodule Explorer.Utility.MissingBlockRange do
     |> Enum.sort_by(& &1.from_number, &>=/2)
   end
 
+  defp priority_filter(%{claim_id: claim_id}, _priority) when not is_nil(claim_id), do: false
   defp priority_filter(range, nil), do: is_nil(range.priority)
   defp priority_filter(_range, _priority), do: true
+
+  defp unclaimed?(range), do: is_nil(range.claim_id)
+
+  defp promote_claimed_ranges(_ranges, nil), do: :ok
+
+  defp promote_claimed_ranges(ranges, priority) do
+    ranges
+    |> Enum.filter(&(not unclaimed?(&1) && is_nil(&1.priority)))
+    |> Enum.each(fn range ->
+      range
+      |> change(priority: priority)
+      |> Repo.update!()
+    end)
+  end
+
+  defp inherit_claim(range, params) do
+    Map.merge(params, %{claim_id: range.claim_id, claim_expires_at: range.claim_expires_at})
+  end
 
   # Deletes all missing block ranges that overlap with the interval [from, to]
   @spec delete_ranges_between([__MODULE__.t()], Block.block_number(), Block.block_number()) :: :ok
@@ -630,6 +748,73 @@ defmodule Explorer.Utility.MissingBlockRange do
   @spec min_max_block_query() :: Ecto.Query.t()
   def min_max_block_query do
     from(r in __MODULE__, select: %{min: min(r.to_number), max: max(r.from_number)})
+  end
+
+  defp get_claimable_range_query(now) do
+    from(r in __MODULE__,
+      where: is_nil(r.claim_id) or r.claim_expires_at <= ^now,
+      order_by: [desc_nulls_last: r.priority, desc: r.from_number],
+      limit: 1,
+      lock: "FOR UPDATE SKIP LOCKED"
+    )
+  end
+
+  defp claim_ranges(0, _claim_id, _claim_expires_at, _now, claimed_ranges), do: Enum.reverse(claimed_ranges)
+
+  defp claim_ranges(remaining_count, claim_id, claim_expires_at, now, claimed_ranges) do
+    now
+    |> get_claimable_range_query()
+    |> Repo.one()
+    |> case do
+      nil ->
+        Enum.reverse(claimed_ranges)
+
+      range ->
+        claimed_count = min(range.from_number - range.to_number + 1, remaining_count)
+        claimed_to_number = range.from_number - claimed_count + 1
+
+        claim_range!(range, claimed_to_number, claim_id, claim_expires_at)
+
+        claimed_range = Range.new(range.from_number, claimed_to_number, -1)
+
+        claim_ranges(
+          remaining_count - claimed_count,
+          claim_id,
+          claim_expires_at,
+          now,
+          [claimed_range | claimed_ranges]
+        )
+    end
+  end
+
+  defp claim_range!(range, claimed_to_number, claim_id, claim_expires_at) do
+    original_to_number = range.to_number
+
+    range
+    |> change(%{
+      to_number: claimed_to_number,
+      claim_id: claim_id,
+      claim_expires_at: claim_expires_at
+    })
+    |> Repo.update!()
+
+    if claimed_to_number > original_to_number do
+      %{from_number: claimed_to_number - 1, to_number: original_to_number, priority: range.priority}
+      |> changeset()
+      |> Repo.insert!()
+    end
+  end
+
+  defp save_released_range!(range, priority) do
+    case save_range(range, priority) do
+      {:ok, _result} -> :ok
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp database_now do
+    %{rows: [[now]]} = Ecto.Adapters.SQL.query!(Repo, "SELECT clock_timestamp()", [])
+    now
   end
 
   defp get_latest_ranges_query(size) do

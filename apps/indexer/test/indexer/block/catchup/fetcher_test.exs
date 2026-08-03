@@ -13,8 +13,8 @@ defmodule Indexer.Block.Catchup.FetcherTest do
   alias Indexer.Block
   alias Indexer.Block.Catchup.Fetcher
   alias Indexer.Block.Catchup.MissingRangesCollector
-  alias Indexer.Fetcher.CoinBalance.Catchup, as: CoinBalanceCatchup
   alias Indexer.Fetcher.{BlockReward, InternalTransaction, Token, UncleBlock}
+  alias Indexer.Fetcher.CoinBalance.Catchup, as: CoinBalanceCatchup
   alias Indexer.Fetcher.OnDemand.ContractCreator, as: ContractCreatorOnDemand
   alias Indexer.Fetcher.TokenBalance.Current, as: TokenBalanceCurrent
   alias Indexer.Fetcher.TokenBalance.Historical, as: TokenBalanceHistorical
@@ -650,7 +650,13 @@ defmodule Indexer.Block.Catchup.FetcherTest do
     end
 
     test "failed blocks handles correctly", %{json_rpc_named_arguments: json_rpc_named_arguments} do
-      Application.put_env(:indexer, Indexer.Block.Catchup.Fetcher, batch_size: 2, concurrency: 10)
+      Application.put_env(:indexer, Indexer.Block.Catchup.Fetcher,
+        batch_size: 2,
+        concurrency: 10,
+        range_claim_lease_duration: 60_000,
+        range_claiming_enabled?: true
+      )
+
       Application.put_env(:indexer, :block_ranges, "0..1")
       start_supervised!({Task.Supervisor, name: Indexer.Block.Catchup.TaskSupervisor})
       MissingRangesCollector.start_link([])
@@ -700,7 +706,7 @@ defmodule Indexer.Block.Catchup.FetcherTest do
 
       Process.sleep(1000)
 
-      assert %{from_number: 1, to_number: 0} = Repo.one(MissingBlockRange)
+      assert %{from_number: 1, to_number: 0, claim_id: nil, claim_expires_at: nil} = Repo.one(MissingBlockRange)
     end
 
     if Application.compile_env(:explorer, :chain_type) == :stability do

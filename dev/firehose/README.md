@@ -19,6 +19,8 @@ Realtime is unaffected — it keeps following the head over JSON-RPC, where its 
 |---|---|
 | `INDEXER_FIREHOSE_URL` | Sidecar endpoint. Unset (default) = stock JSON-RPC behaviour. |
 | `INDEXER_FIREHOSE_TIMEOUT` | Request timeout, default `60s`. |
+| `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIMING_ENABLED` | Set `true` on every catchup replica to partition backfill; default `false`. |
+| `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIM_LEASE_DURATION` | Crash-recovery lease, renewed while work is active; default `10m`. |
 
 The sidecar also requires a mapping policy. `FIREHOSE_CHAIN_FAMILY` defaults to `arbitrum` for the
 original Orbit deployment. Set it to `ethereum` explicitly for experimental Cancun/Prague support.
@@ -79,9 +81,15 @@ node firehose-sidecar.js
 
 Blockscout parallelizes catchup inside one indexer instance. Increase
 `INDEXER_CATCHUP_BLOCKS_CONCURRENCY` alongside `FIREHOSE_WORKERS`; the defaults are 10 concurrent
-ranges and `cores - 2` sidecar processes. Multiple catchup-enabled indexer replicas sharing one
-database are not a scaling mechanism today because they can select the same unclaimed missing
-ranges and duplicate the work.
+ranges and `cores - 2` sidecar processes.
+
+To add catchup-enabled indexer replicas against the same database, set
+`INDEXER_CATCHUP_BLOCKS_RANGE_CLAIMING_ENABLED=true` on all of them. The replicas then lease
+disjoint ranges and renew their leases until import finishes. A crashed replica's work is available
+again after `INDEXER_CATCHUP_BLOCKS_RANGE_CLAIM_LEASE_DURATION` (default `10m`). Do not mix this with
+legacy catchup replicas, because a legacy replica does not claim its work. The feature coordinates
+both JSON-RPC and Firehose catchup; Firehose throughput still also depends on `FIREHOSE_WORKERS` and
+the connector, upstream, and database capacity.
 
 Or pass them inline:
 

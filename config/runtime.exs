@@ -1301,7 +1301,10 @@ config :indexer, Indexer.Block.Catchup.MissingRangesCollector,
 
 config :indexer, Indexer.Block.Catchup.Fetcher,
   batch_size: ConfigHelper.parse_integer_env_var("INDEXER_CATCHUP_BLOCKS_BATCH_SIZE", 10),
-  concurrency: ConfigHelper.parse_integer_env_var("INDEXER_CATCHUP_BLOCKS_CONCURRENCY", 10)
+  concurrency: ConfigHelper.parse_integer_env_var("INDEXER_CATCHUP_BLOCKS_CONCURRENCY", 10),
+  range_claiming_enabled?: ConfigHelper.parse_bool_env_var("INDEXER_CATCHUP_BLOCKS_RANGE_CLAIMING_ENABLED", "false"),
+  range_claim_lease_duration:
+    ConfigHelper.parse_time_env_var("INDEXER_CATCHUP_BLOCKS_RANGE_CLAIM_LEASE_DURATION", "10m")
 
 config :indexer, Indexer.Fetcher.BlockReward,
   batch_size: ConfigHelper.parse_integer_env_var("INDEXER_BLOCK_REWARD_BATCH_SIZE", 10),
