@@ -107,8 +107,10 @@ defmodule BlockScoutWeb.V2.ExchangeRateChannelTest do
       records = [%{date: today, closing_price: token.fiat_value} | old_records]
 
       MarketHistory.bulk_insert(records)
+      ConCache.delete(MarketHistoryCache.cache_name(), MarketHistoryCache.updated_at_key())
+      ConCache.delete(MarketHistoryCache.cache_name(), MarketHistoryCache.data_key())
 
-      Market.fetch_recent_history()
+      assert Enum.map(Market.fetch_recent_history(), &Map.take(&1, [:date, :closing_price])) == records
 
       topic = "exchange_rate:new_rate"
       @endpoint.subscribe(topic)
