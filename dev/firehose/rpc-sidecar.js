@@ -125,7 +125,8 @@ const server = http.createServer(async (req, res) => {
       throw new Error("start_block/end_block must be integers with start_block <= end_block");
     }
   } catch (e) {
-    return send(400, { error: String(e.message || e) });
+    console.warn("[sidecar] rejected invalid range request:", e);
+    return send(400, { error: "invalid range request" });
   }
 
   const started = Date.now();
@@ -138,8 +139,8 @@ const server = http.createServer(async (req, res) => {
     );
     send(200, { blocks });
   } catch (e) {
-    console.error(`[sidecar] ${start}..${end} failed:`, e.message);
-    send(502, { error: String(e.message || e) });
+    console.error(`[sidecar] ${start}..${end} failed:`, e);
+    send(502, { error: "JSON-RPC range fetch failed" });
   }
 });
 

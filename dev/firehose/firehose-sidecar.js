@@ -641,7 +641,8 @@ const server = http.createServer(async (req, res) => {
       throw new Error("start_block/end_block must be integers with start_block <= end_block");
     }
   } catch (e) {
-    return send(400, { error: String(e.message || e) });
+    console.warn("[firehose] rejected invalid range request:", e);
+    return send(400, { error: "invalid range request" });
   }
 
   const started = Date.now();
@@ -652,15 +653,15 @@ const server = http.createServer(async (req, res) => {
       (a, b) => a + b.traces.reduce((n, t) => n + countFrames(t.result), 0),
       0
     );
-    const bals = blocks.reduce((a, b) => a + b.balanceChanges.length, 0);
+    const balanceChanges = blocks.reduce((a, b) => a + b.balanceChanges.length, 0);
     console.log(
       `[firehose] ${start}..${end} -> ${blocks.length} blocks, ${txs} txs, ${itxs} calls, ` +
-        `${bals} balances in ${Date.now() - started}ms`
+        `${balanceChanges} balances in ${Date.now() - started}ms`
     );
     send(200, { blocks });
   } catch (e) {
-    console.error(`[firehose] ${start}..${end} failed: ${e.message}`);
-    send(502, { error: String(e.message || e) });
+    console.error(`[firehose] ${start}..${end} failed:`, e);
+    send(502, { error: "firehose range fetch failed" });
   }
 });
 
@@ -727,6 +728,7 @@ module.exports = {
   coinBalances,
   convertBlock,
   flattenTrace,
+  server,
   start,
   validateBlockFamily,
   validateFetchedRange,

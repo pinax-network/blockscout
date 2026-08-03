@@ -6,6 +6,7 @@ const {
   coinBalances,
   convertBlock,
   flattenTrace,
+  server,
   validateBlockFamily,
   validateFetchedRange,
 } = require("./firehose-sidecar");
@@ -155,6 +156,28 @@ test("validateFetchedRange rejects incomplete, duplicate, and unexpected respons
     () => validateFetchedRange([{ number: 9 }, { number: 10 }, { number: 10 }], 10, 11),
     /missing=\[11\].*duplicates=\[10\].*unexpected=\[9\]/
   );
+});
+
+test("HTTP errors do not expose caught exception details", async (context) => {
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  context.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const { port } = server.address();
+  const invalidResponse = await fetch(`http://127.0.0.1:${port}/v1/blocks`, {
+    method: "POST",
+    body: "{",
+  });
+
+  assert.equal(invalidResponse.status, 400);
+  assert.deepEqual(await invalidResponse.json(), { error: "invalid range request" });
+
+  const upstreamResponse = await fetch(`http://127.0.0.1:${port}/v1/blocks`, {
+    method: "POST",
+    body: JSON.stringify({ start_block: 10, end_block: 10 }),
+  });
+
+  assert.equal(upstreamResponse.status, 502);
+  assert.deepEqual(await upstreamResponse.json(), { error: "firehose range fetch failed" });
 });
 
 test("convertBlock preserves Cancun and Prague block, blob transaction, and receipt fields", () => {
