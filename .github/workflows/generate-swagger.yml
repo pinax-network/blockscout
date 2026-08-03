@@ -155,6 +155,7 @@ jobs:
           retention-days: 1
 
   push-specs:
+    if: vars.API_SPECS_REPOSITORY != ''
     needs: 
       - generate-swagger
       - matrix-builder
