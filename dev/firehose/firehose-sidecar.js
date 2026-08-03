@@ -1,0 +1,735 @@
+#!/usr/bin/env node
+//
+// Firehose-backed sidecar for Blockscout's EthereumJSONRPC.Firehose.
+//
+// Streams sf.ethereum.type.v2.Block ("extended" blocks) over gRPC and reshapes each one into the
+// three JSON-RPC payloads Blockscout's parsers already understand - eth_getBlockByNumber,
+// eth_getBlockReceipts, and debug_traceBlockByNumber(callTracer) - so one Firehose block replaces
+// three round trips to an archive node.
+//
+//   POST /v1/blocks  {"start_block": 1, "end_block": 10}
+//   -> {"blocks": [{"number", "block", "receipts", "traces"}, ...]}
+//
+// Usage:
+//   FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> node firehose-sidecar.js
+
+const http = require("http");
+const path = require("path");
+const fs = require("fs");
+const cluster = require("cluster");
+const grpc = require("@grpc/grpc-js");
+const protoLoader = require("@grpc/proto-loader");
+const protobuf = require("protobufjs");
+
+// Load a .env sitting next to this file, if present, without pulling in a dependency. Real
+// environment variables always win, so the file is only a convenience for local runs.
+(function loadDotEnv() {
+  const envPath = path.join(__dirname, ".env");
+  if (!fs.existsSync(envPath)) return;
+  for (const line of fs.readFileSync(envPath, "utf8").split("\n")) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*)\s*$/i);
+    if (!m) continue;
+    const key = m[1];
+    const value = m[2].replace(/^['"]|['"]$/g, "");
+    if (!(key in process.env)) process.env[key] = value;
+  }
+})();
+
+const ENDPOINT = process.env.FIREHOSE_ENDPOINT || "";
+const PORT = 8082;
+const WORKERS = 8;
+const SUPPORTED_CHAIN_FAMILIES = new Set(["arbitrum", "ethereum"]);
+
+// Reuse Blockscout's native chain selection instead of introducing a Firehose-specific setting.
+// The default Blockscout build follows Ethereum semantics; unsupported chain families fail closed.
+function chainFamilyForChainType(chainType) {
+  if (!chainType || chainType === "default" || chainType === "ethereum") return "ethereum";
+  return chainType;
+}
+
+const CHAIN_FAMILY = chainFamilyForChainType(process.env.CHAIN_TYPE);
+const API_KEY = process.env.FIREHOSE_API_KEY || "";
+
+const PROTO_OPTS = {
+  keepCase: false,
+  longs: String,
+  enums: String,
+  defaults: true,
+  oneofs: true,
+  includeDirs: [path.join(__dirname, "proto")],
+};
+
+const firehosePkg = grpc.loadPackageDefinition(
+  protoLoader.loadSync("sf/firehose/v2/firehose.proto", PROTO_OPTS)
+);
+// The Any inside Response.block is decoded separately, against the Ethereum block type - it lives
+// in a different Buf module (streamingfast/firehose-ethereum) than the Stream service
+// (streamingfast/firehose). protobufjs is used here rather than proto-loader because only it
+// hands back a message class with a usable `decode`.
+const ethRoot = new protobuf.Root();
+ethRoot.resolvePath = (_origin, target) =>
+  target.startsWith("google/")
+    ? protobuf.util.path.resolve(path.join(__dirname, "node_modules/protobufjs/"), target)
+    : path.join(__dirname, "proto", target);
+ethRoot.loadSync("sf/ethereum/type/v2/type.proto", { keepCase: false });
+const EthBlock = ethRoot.lookupType("sf.ethereum.type.v2.Block");
+
+function makeClient() {
+  return new firehosePkg.sf.firehose.v2.Stream(ENDPOINT, grpc.credentials.createSsl(), {
+    "grpc.max_receive_message_length": 50 * 1024 * 1024,
+    "grpc.keepalive_time_ms": 30000,
+  });
+}
+
+const client = ENDPOINT ? makeClient() : null;
+
+function metadata() {
+  const md = new grpc.Metadata();
+  if (API_KEY) md.set("x-api-key", API_KEY);
+  return md;
+}
+
+// ---------------------------------------------------------------- conversion
+
+const EMPTY = "0x";
+// data fields: "0x" is a valid empty value
+const hex = (b) => (b && b.length ? "0x" + Buffer.from(b).toString("hex") : EMPTY);
+const addr = (b) => (b && b.length ? "0x" + Buffer.from(b).toString("hex") : null);
+const qty = (n) => "0x" + BigInt(n || 0).toString(16);
+// quantity fields carried as bytes (v/r/s): Blockscout runs these through
+// quantity_to_integer/1, which rejects a bare "0x", so empty has to become "0x0"
+const qtyBytes = (b) => (b && b.length ? "0x" + BigInt("0x" + Buffer.from(b).toString("hex")).toString(16) : "0x0");
+// fixed-width data fields, e.g. the block's 8-byte nonce
+const hexPadded = (n, bytes) => "0x" + BigInt(n || 0).toString(16).padStart(bytes * 2, "0");
+const hasBytes = (b) => b && b.length;
+const hasValue = (value) => value !== undefined && value !== null;
+
+// BigInt messages carry a big-endian two's complement byte string.
+function bigIntQty(msg) {
+  if (!msg) return "0x0";
+  const b = msg.bytes;
+  if (!b || !b.length) return "0x0";
+  return "0x" + (BigInt("0x" + Buffer.from(b).toString("hex"))).toString(16);
+}
+
+function timestampSeconds(ts) {
+  if (!ts) return 0;
+  if (typeof ts === "string") return Math.floor(new Date(ts).getTime() / 1000);
+  return Number(ts.seconds || 0);
+}
+
+// Firehose collapses CREATE and CREATE2 into a single CALL_TYPE; there is no flag distinguishing
+// them, so a create2 shows up as "CREATE" and Blockscout records it as :create rather than
+// :create2. Everything else maps one-to-one onto geth's callTracer vocabulary.
+const CALL_TYPE = {
+  CALL: "CALL",
+  CALLCODE: "CALLCODE",
+  DELEGATE: "DELEGATECALL",
+  STATIC: "STATICCALL",
+  CREATE: "CREATE",
+  UNSPECIFIED: "CALL",
+};
+
+// Firehose flags a self-destructing contract with `suicide: true` on the call that created or
+// entered it. A node's callTracer instead emits a *separate* SELFDESTRUCT frame nested inside that
+// call, so one Firehose call corresponds to two tracer frames and has to be expanded.
+//
+// `from` and `value` come off the REASON_SUICIDE_WITHDRAW balance change. The beneficiary is only
+// recoverable when the balance actually moved (REASON_SUICIDE_REFUND); a zero-value selfdestruct
+// records no refund, so `to` is omitted in that case.
+function selfdestructFrame(call) {
+  const withdraw = (call.balanceChanges || []).find((b) => b.reason === "REASON_SUICIDE_WITHDRAW");
+  const refund = (call.balanceChanges || []).find((b) => b.reason === "REASON_SUICIDE_REFUND");
+
+  const frame = {
+    type: "SELFDESTRUCT",
+    from: addr(call.address) || EMPTY,
+    value: withdraw ? bigIntQty(withdraw.oldValue) : "0x0",
+    gas: "0x0",
+    gasUsed: "0x0",
+  };
+  const beneficiary = refund && addr(refund.address);
+  if (beneficiary) frame.to = beneficiary;
+  return frame;
+}
+
+function callFrame(call) {
+  const frame = {
+    type: CALL_TYPE[call.callType] || "CALL",
+    from: addr(call.caller) || EMPTY,
+    to: addr(call.address) || undefined,
+    value: bigIntQty(call.value),
+    gas: qty(call.gasLimit),
+    gasUsed: qty(call.gasConsumed),
+    input: hex(call.input),
+    output: hex(call.returnData),
+  };
+
+  if (call.statusFailed || call.statusReverted) {
+    frame.error = call.failureReason || (call.statusReverted ? "execution reverted" : "error");
+  }
+  if (frame.output === EMPTY) delete frame.output;
+  if (frame.to === undefined) delete frame.to;
+
+  return frame;
+}
+
+// Firehose emits a transaction's calls as a flat list carrying index/parentIndex; callTracer wants
+// them nested. Rebuild the tree in one pass. Index 0 means "no parent" (proto3 default), so the
+// root is the call whose parentIndex is absent or 0.
+function buildCallTree(calls) {
+  if (!calls || !calls.length) return null;
+
+  const byIndex = new Map();
+  for (const call of calls) byIndex.set(Number(call.index), { call, frame: callFrame(call) });
+
+  let root = null;
+  for (const { call, frame } of byIndex.values()) {
+    const parentIndex = Number(call.parentIndex || 0);
+    const parent = parentIndex ? byIndex.get(parentIndex) : null;
+
+    if (!parent) {
+      // first rootless call wins; any others are appended to it so nothing is silently dropped
+      if (!root) root = frame;
+      else (root.calls = root.calls || []).push(frame);
+    } else {
+      (parent.frame.calls = parent.frame.calls || []).push(frame);
+    }
+  }
+
+  // Expand `suicide` into the extra SELFDESTRUCT frame a tracer would emit. Done after the tree is
+  // assembled so the synthetic frame lands last among its siblings, which is where a node puts it.
+  for (const { call, frame } of byIndex.values()) {
+    if (call.suicide) (frame.calls = frame.calls || []).push(selfdestructFrame(call));
+  }
+
+  return root;
+}
+
+const FAILED_TRANSACTION_BALANCE_REASONS = new Set([
+  "REASON_GAS_BUY",
+  "REASON_GAS_REFUND",
+  "REASON_REWARD_TRANSACTION_FEE",
+]);
+
+// Final native balance per account in the block. balance_changes are recorded state - the node
+// wrote these values down - but the extended model also retains state changes from reverted calls.
+// Successful transactions contribute only non-reverted calls. For failed transactions, Firehose's
+// contract says only the root call's gas buy/refund and transaction fee changes survive. Ordinals
+// give the total order, so the highest committed change per address is the end-of-block value.
+function coinBalances(block) {
+  const final = new Map();
+  const take = (bc) => {
+    const address = addr(bc.address);
+    if (!address) return;
+    const ordinal = Number(bc.ordinal || 0);
+    const prev = final.get(address);
+    if (!prev || ordinal > prev.ordinal) final.set(address, { ordinal, value: bigIntQty(bc.newValue) });
+  };
+
+  for (const bc of block.balanceChanges || []) take(bc); // block-level, e.g. rewards
+  for (const call of block.systemCalls || []) {
+    if (!call.stateReverted) for (const bc of call.balanceChanges || []) take(bc);
+  }
+
+  for (const transaction of block.transactionTraces || []) {
+    const calls = transaction.calls || [];
+
+    if (transaction.status === "SUCCEEDED") {
+      for (const call of calls) {
+        if (!call.stateReverted) for (const bc of call.balanceChanges || []) take(bc);
+      }
+    } else if (transaction.status === "FAILED" || transaction.status === "REVERTED") {
+      const rootCall = calls.find((call) => Number(call.parentIndex || 0) === 0);
+      for (const bc of (rootCall && rootCall.balanceChanges) || []) {
+        if (FAILED_TRANSACTION_BALANCE_REASONS.has(bc.reason)) take(bc);
+      }
+    }
+  }
+
+  return [...final].map(([address, v]) => ({ address, value: v.value }));
+}
+
+function authorizationList(authorizations) {
+  return (authorizations || []).map((authorization, index) => {
+    if (!hasBytes(authorization.address)) {
+      throw new Error(`set-code authorization ${index} is missing its delegate address`);
+    }
+
+    return {
+      chainId: qtyBytes(authorization.chainId),
+      address: addr(authorization.address),
+      nonce: qty(authorization.nonce),
+      yParity: qty(authorization.v),
+      r: qtyBytes(authorization.r),
+      s: qtyBytes(authorization.s),
+    };
+  });
+}
+
+function accessList(entries) {
+  return (entries || []).map((entry) => ({
+    address: addr(entry.address) || EMPTY,
+    storageKeys: (entry.storageKeys || []).map(hex),
+  }));
+}
+
+function convertBlock(block) {
+  const header = block.header || {};
+  const number = Number(block.number);
+  const blockHash = hex(block.hash);
+  const blockNumberHex = qty(number);
+  const traces = block.transactionTraces || [];
+
+  const transactions = traces.map((t) => {
+    if (
+      (t.type === "TRX_TYPE_DYNAMIC_FEE" ||
+        t.type === "TRX_TYPE_BLOB" ||
+        t.type === "TRX_TYPE_SET_CODE") &&
+      (!hasValue(t.maxFeePerGas) || !hasValue(t.maxPriorityFeePerGas))
+    ) {
+      throw new Error(`fee-market transaction ${hex(t.hash)} is missing its max fee fields`);
+    }
+
+    const transaction = {
+      hash: hex(t.hash),
+      nonce: qty(t.nonce),
+      blockHash,
+      blockNumber: blockNumberHex,
+      transactionIndex: qty(t.index),
+      from: addr(t.from) || EMPTY,
+      to: addr(t.to),
+      value: bigIntQty(t.value),
+      gas: qty(t.gasLimit),
+      gasPrice: bigIntQty(t.gasPrice),
+      maxFeePerGas: bigIntQty(t.maxFeePerGas),
+      maxPriorityFeePerGas: bigIntQty(t.maxPriorityFeePerGas),
+      input: hex(t.input),
+      type: qty(typeNumber(t.type)),
+      v: qtyBytes(t.v),
+      r: qtyBytes(t.r),
+      s: qtyBytes(t.s),
+    };
+
+    if (
+      t.type === "TRX_TYPE_ACCESS_LIST" ||
+      t.type === "TRX_TYPE_DYNAMIC_FEE" ||
+      t.type === "TRX_TYPE_BLOB" ||
+      t.type === "TRX_TYPE_SET_CODE"
+    ) {
+      transaction.accessList = accessList(t.accessList);
+    }
+
+    if (t.type === "TRX_TYPE_BLOB") {
+      if (!hasValue(t.blobGasFeeCap) || !(t.blobHashes || []).length) {
+        throw new Error(`blob transaction ${hex(t.hash)} is missing its blob fee cap or versioned hashes`);
+      }
+      transaction.maxFeePerBlobGas = bigIntQty(t.blobGasFeeCap);
+      transaction.blobVersionedHashes = t.blobHashes.map(hex);
+    }
+
+    if (t.type === "TRX_TYPE_SET_CODE") {
+      transaction.authorizationList = authorizationList(t.setCodeAuthorizations);
+    }
+
+    return transaction;
+  });
+
+  const receipts = traces.map((t) => {
+    const receipt = t.receipt || {};
+    // A contract creation's address is only on the CREATE call, not on the receipt message.
+    const created =
+      addr(t.to) === null
+        ? (t.calls || []).find((c) => c.callType === "CREATE" && Number(c.parentIndex || 0) === 0)
+        : null;
+
+    const converted = {
+      transactionHash: hex(t.hash),
+      transactionIndex: qty(t.index),
+      blockHash,
+      blockNumber: blockNumberHex,
+      from: addr(t.from) || EMPTY,
+      to: addr(t.to),
+      cumulativeGasUsed: qty(receipt.cumulativeGasUsed),
+      gasUsed: qty(t.gasUsed),
+      effectiveGasPrice: bigIntQty(t.gasPrice),
+      contractAddress: created ? addr(created.address) : null,
+      logsBloom: hex(receipt.logsBloom),
+      // status lives on the trace, not the receipt
+      status: t.status === "SUCCEEDED" ? "0x1" : "0x0",
+      type: qty(typeNumber(t.type)),
+      logs: (receipt.logs || []).map((log) => ({
+        address: addr(log.address) || EMPTY,
+        topics: (log.topics || []).map(hex),
+        data: hex(log.data),
+        // JSON-RPC logIndex is block-scoped; Firehose's `index` is transaction-scoped
+        logIndex: qty(log.blockIndex),
+        transactionHash: hex(t.hash),
+        transactionIndex: qty(t.index),
+        blockHash,
+        blockNumber: blockNumberHex,
+        removed: false,
+      })),
+    };
+
+    if (t.type === "TRX_TYPE_BLOB") {
+      if (!hasValue(receipt.blobGasUsed) || !hasValue(receipt.blobGasPrice)) {
+        throw new Error(`blob receipt ${hex(t.hash)} is missing blob gas usage or price`);
+      }
+      converted.blobGasUsed = qty(receipt.blobGasUsed);
+      converted.blobGasPrice = bigIntQty(receipt.blobGasPrice);
+    }
+
+    return converted;
+  });
+
+  // Block-level system calls are not attached to any TransactionTrace. Arbitrum exposes them
+  // through callTracer under its ArbOS internal transaction, so attach by transaction type rather
+  // than assuming index 0. Ethereum's Cancun/Prague protocol calls have no transaction and are not
+  // returned by debug_traceBlockByNumber, so they deliberately remain outside `callTraces`.
+  const systemFrame = buildCallTree(block.systemCalls);
+  const systemTransactions = traces.filter(isSystemTransaction);
+  if (systemFrame && systemTransactions.length > 1) {
+    throw new Error(`block ${number} has multiple Arbitrum system transactions`);
+  }
+  const systemTransaction = systemTransactions[0];
+
+  const callTraces = traces.map((t) => {
+    const result = buildCallTree(t.calls);
+    if (!result) throw new Error(`transaction ${hex(t.hash)} has no call trace`);
+    if (systemFrame && t === systemTransaction) {
+      (result.calls = result.calls || []).push(systemFrame);
+    }
+    return { txHash: hex(t.hash), result };
+  });
+
+  const convertedBlock = {
+    hash: blockHash,
+    number: blockNumberHex,
+    parentHash: hex(header.parentHash),
+    sha3Uncles: hex(header.uncleHash),
+    miner: addr(header.coinbase) || EMPTY,
+    stateRoot: hex(header.stateRoot),
+    transactionsRoot: hex(header.transactionsRoot),
+    receiptsRoot: hex(header.receiptRoot),
+    logsBloom: hex(header.logsBloom),
+    difficulty: bigIntQty(header.difficulty),
+    totalDifficulty: bigIntQty(header.totalDifficulty),
+    gasLimit: qty(header.gasLimit),
+    gasUsed: qty(header.gasUsed),
+    timestamp: qty(timestampSeconds(header.timestamp)),
+    extraData: hex(header.extraData),
+    mixHash: hex(header.mixHash),
+    nonce: hexPadded(header.nonce, 8),
+    baseFeePerGas: header.baseFeePerGas ? bigIntQty(header.baseFeePerGas) : undefined,
+    size: qty(block.size),
+    uncles: (block.uncles || []).map((uncle) => hex(uncle.hash)),
+    withdrawals: (block.withdrawals || []).map((w) => ({
+      index: qty(w.index),
+      validatorIndex: qty(w.validatorIndex),
+      address: addr(w.address) || EMPTY,
+      amount: qty(w.amount),
+    })),
+    transactions,
+  };
+
+  if (hasBytes(header.withdrawalsRoot)) convertedBlock.withdrawalsRoot = hex(header.withdrawalsRoot);
+  if (hasValue(header.blobGasUsed)) convertedBlock.blobGasUsed = qty(header.blobGasUsed);
+  if (hasValue(header.excessBlobGas)) convertedBlock.excessBlobGas = qty(header.excessBlobGas);
+  if (hasBytes(header.parentBeaconRoot)) {
+    convertedBlock.parentBeaconBlockRoot = hex(header.parentBeaconRoot);
+  }
+  if (hasBytes(header.requestsHash)) convertedBlock.requestsHash = hex(header.requestsHash);
+
+  return {
+    number,
+    block: convertedBlock,
+    receipts,
+    traces: callTraces,
+    balanceChanges: coinBalances(block),
+  };
+}
+
+// Arbitrum's bookkeeping transaction is where its node tracer hangs block-level system calls.
+// Match the explicit type: index 0 is conventional but not part of the protobuf contract.
+function isSystemTransaction(t) {
+  return t.type === "TRX_TYPE_ARBITRUM_INTERNAL";
+}
+
+function typeNumber(type) {
+  switch (type) {
+    case "TRX_TYPE_LEGACY":
+      return 0;
+    case "TRX_TYPE_ACCESS_LIST":
+      return 1;
+    case "TRX_TYPE_DYNAMIC_FEE":
+      return 2;
+    case "TRX_TYPE_BLOB":
+      return 3;
+    case "TRX_TYPE_SET_CODE":
+      return 4;
+    case "TRX_TYPE_ARBITRUM_DEPOSIT":
+      return 100;
+    case "TRX_TYPE_ARBITRUM_UNSIGNED":
+      return 101;
+    case "TRX_TYPE_ARBITRUM_CONTRACT":
+      return 102;
+    case "TRX_TYPE_ARBITRUM_RETRY":
+      return 104;
+    case "TRX_TYPE_ARBITRUM_SUBMIT_RETRYABLE":
+      return 105;
+    case "TRX_TYPE_ARBITRUM_INTERNAL":
+      return 106;
+    case "TRX_TYPE_ARBITRUM_LEGACY":
+      return 120;
+    case "TRX_TYPE_OPTIMISM_DEPOSIT":
+      return 126;
+    case "TRX_TYPE_POLYGON_STATE_SYNC":
+      return 200;
+    default:
+      throw new Error(`unsupported Firehose transaction type ${type}`);
+  }
+}
+
+function validateBlockFamily(block, chainFamily = CHAIN_FAMILY) {
+  if (!SUPPORTED_CHAIN_FAMILIES.has(chainFamily)) {
+    throw new Error(
+      `unsupported CHAIN_TYPE ${chainFamily}; Firehose supports arbitrum and ethereum`
+    );
+  }
+
+  const traces = block.transactionTraces || [];
+  const familySpecific = traces.find((trace) => {
+    if (trace.type.startsWith("TRX_TYPE_ARBITRUM_")) return chainFamily !== "arbitrum";
+    if (trace.type === "TRX_TYPE_OPTIMISM_DEPOSIT") return true;
+    if (trace.type === "TRX_TYPE_POLYGON_STATE_SYNC") return true;
+    return false;
+  });
+
+  if (familySpecific) {
+    throw new Error(
+      `transaction ${hex(familySpecific.hash)} has ${familySpecific.type}, which is not supported for ` +
+        `CHAIN_TYPE=${chainFamily}`
+    );
+  }
+
+  if (
+    chainFamily === "arbitrum" &&
+    (block.systemCalls || []).length &&
+    !traces.some(isSystemTransaction)
+  ) {
+    throw new Error(
+      `block ${block.number} has system calls but no Arbitrum internal transaction; ` +
+        `check CHAIN_TYPE`
+    );
+  }
+}
+
+// ------------------------------------------------------------------ streaming
+
+function fetchRange(startBlock, endBlock) {
+  return new Promise((resolve, reject) => {
+    const out = [];
+    // proto-loader is loaded with keepCase:false, so request fields are camelCase here
+    const stream = client.Blocks(
+      {
+        startBlockNum: startBlock,
+        stopBlockNum: endBlock, // inclusive
+        finalBlocksOnly: true,
+      },
+      metadata(),
+      { deadline: Date.now() + 120000 }
+    );
+
+    stream.on("data", (response) => {
+      try {
+        // Response.block is a google.protobuf.Any wrapping sf.ethereum.type.v2.Block.
+        // toObject with enums-as-strings gives the same shape the converter reads.
+        const block = EthBlock.toObject(EthBlock.decode(response.block.value), {
+          enums: String,
+          longs: String,
+          bytes: Buffer,
+          defaults: true,
+        });
+        validateBlockFamily(block);
+        out.push(convertBlock(block));
+      } catch (e) {
+        stream.cancel();
+        reject(new Error(`decode failed: ${e.message}`));
+      }
+    });
+    stream.on("error", (e) => {
+      if (e.code === grpc.status.CANCELLED) return;
+      if (e.code === grpc.status.UNAUTHENTICATED || e.code === grpc.status.PERMISSION_DENIED) {
+        return reject(
+          new Error(
+            `firehose auth rejected (${e.details || e.message}). ` +
+              `Set FIREHOSE_API_KEY - see dev/firehose/.env.example`
+          )
+        );
+      }
+      reject(new Error(`firehose stream: ${e.details || e.message}`));
+    });
+    stream.on("end", () => {
+      try {
+        validateFetchedRange(out, startBlock, endBlock);
+        resolve(out);
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+function validateFetchedRange(blocks, startBlock, endBlock) {
+  const expected = endBlock - startBlock + 1;
+  const counts = new Map();
+  for (const block of blocks) counts.set(block.number, (counts.get(block.number) || 0) + 1);
+
+  const missing = [];
+  for (let number = startBlock; number <= endBlock; number++) {
+    if (!counts.has(number)) missing.push(number);
+  }
+
+  const duplicates = [...counts]
+    .filter(([, count]) => count > 1)
+    .map(([number]) => number)
+    .sort((a, b) => a - b);
+  const unexpected = [...counts.keys()]
+    .filter((number) => number < startBlock || number > endBlock)
+    .sort((a, b) => a - b);
+
+  if (blocks.length !== expected || missing.length || duplicates.length || unexpected.length) {
+    throw new Error(
+      `incomplete firehose range ${startBlock}..${endBlock}: ` +
+        `missing=${JSON.stringify(missing)} duplicates=${JSON.stringify(duplicates)} ` +
+        `unexpected=${JSON.stringify(unexpected)}`
+    );
+  }
+}
+
+// ---------------------------------------------------------------- http server
+
+const server = http.createServer(async (req, res) => {
+  const send = (code, obj) => {
+    const body = JSON.stringify(obj);
+    res.writeHead(code, {
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(body),
+    });
+    res.end(body);
+  };
+
+  if (req.method === "GET" && req.url === "/health") {
+    return send(200, {
+      ok: true,
+      endpoint: ENDPOINT,
+      source: "firehose",
+      chainFamily: CHAIN_FAMILY,
+      auth: API_KEY ? "api-key" : "none",
+    });
+  }
+  if (req.method !== "POST") return send(405, { error: "method not allowed" });
+
+  let raw = "";
+  for await (const chunk of req) raw += chunk;
+
+  let start, end;
+  try {
+    ({ start_block: start, end_block: end } = JSON.parse(raw));
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start > end) {
+      throw new Error("start_block/end_block must be integers with start_block <= end_block");
+    }
+  } catch (e) {
+    console.warn("[firehose] rejected invalid range request:", e);
+    return send(400, { error: "invalid range request" });
+  }
+
+  const started = Date.now();
+  try {
+    const blocks = await fetchRange(start, end);
+    const txs = blocks.reduce((a, b) => a + b.receipts.length, 0);
+    const itxs = blocks.reduce(
+      (a, b) => a + b.traces.reduce((n, t) => n + countFrames(t.result), 0),
+      0
+    );
+    const balanceChanges = blocks.reduce((a, b) => a + b.balanceChanges.length, 0);
+    console.log(
+      `[firehose] ${start}..${end} -> ${blocks.length} blocks, ${txs} txs, ${itxs} calls, ` +
+        `${balanceChanges} balances in ${Date.now() - started}ms`
+    );
+    send(200, { blocks });
+  } catch (e) {
+    console.error(`[firehose] ${start}..${end} failed:`, e);
+    send(502, { error: "firehose range fetch failed" });
+  }
+});
+
+function countFrames(frame) {
+  if (!frame) return 0;
+  return 1 + (frame.calls || []).reduce((a, c) => a + countFrames(c), 0);
+}
+
+// Canonical frame representation used by the parity tool. The path is the callTracer-derived
+// trace address Blockscout ultimately stores, so comparisons catch ordering/nesting drift as well
+// as value, gas, result and error differences.
+function flattenTrace(frame, traceAddress = [], out = []) {
+  if (!frame) return out;
+
+  out.push({
+    traceAddress,
+    type: frame.type,
+    from: frame.from,
+    to: frame.to,
+    value: frame.value || "0x0",
+    gas: frame.gas || "0x0",
+    gasUsed: frame.gasUsed || "0x0",
+    input: frame.input || "0x",
+    output: frame.output || "0x",
+    error: frame.error || null,
+  });
+
+  for (const [index, child] of (frame.calls || []).entries()) {
+    flattenTrace(child, [...traceAddress, index], out);
+  }
+  return out;
+}
+
+function start() {
+  if (!ENDPOINT) throw new Error("FIREHOSE_ENDPOINT is required");
+  if (!API_KEY) throw new Error("FIREHOSE_API_KEY is required");
+
+  if (!SUPPORTED_CHAIN_FAMILIES.has(CHAIN_FAMILY)) {
+    throw new Error(
+      `unsupported CHAIN_TYPE ${CHAIN_FAMILY}; Firehose supports arbitrum and ethereum`
+    );
+  }
+
+  if (cluster.isPrimary && WORKERS > 1) {
+    console.log(`[firehose] primary ${process.pid}: forking ${WORKERS} workers, upstream ${ENDPOINT}`);
+    for (let i = 0; i < WORKERS; i++) cluster.fork();
+    cluster.on("exit", (worker, code) => {
+      if (code !== 0) {
+        console.error(`[firehose] worker ${worker.process.pid} died (${code}), restarting`);
+        cluster.fork();
+      }
+    });
+  } else {
+    server.listen(PORT, "127.0.0.1", () =>
+      console.log(`[firehose] worker ${process.pid} listening on :${PORT}, streaming from ${ENDPOINT}`)
+    );
+  }
+}
+
+if (require.main === module) start();
+
+module.exports = {
+  chainFamilyForChainType,
+  coinBalances,
+  convertBlock,
+  flattenTrace,
+  server,
+  start,
+  validateBlockFamily,
+  validateFetchedRange,
+};

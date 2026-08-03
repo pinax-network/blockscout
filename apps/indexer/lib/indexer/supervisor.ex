@@ -110,7 +110,7 @@ defmodule Indexer.Supervisor do
       |> Application.get_all_env()
       |> Keyword.take(
         ~w(blocks_batch_size blocks_concurrency block_interval json_rpc_named_arguments receipts_batch_size
-           receipts_concurrency subscribe_named_arguments realtime_overrides)a
+           receipts_concurrency source subscribe_named_arguments realtime_overrides)a
       )
       |> Enum.into(%{})
       |> Map.put(:memory_monitor, memory_monitor)
@@ -128,9 +128,12 @@ defmodule Indexer.Supervisor do
       |> Map.drop(~w(block_interval blocks_concurrency memory_monitor subscribe_named_arguments realtime_overrides)a)
       |> Block.Fetcher.new()
 
+    # An alternative block source (Firehose) backs catchup only. Realtime keeps following the head
+    # over JSONRPC, where its own reorg detection lives, unless it is overridden explicitly.
     realtime_block_fetcher =
       named_arguments
       |> Map.drop(~w(block_interval blocks_concurrency memory_monitor subscribe_named_arguments realtime_overrides)a)
+      |> Map.put(:source, nil)
       |> Map.merge(Enum.into(realtime_overrides, %{}))
       |> Block.Fetcher.new()
 

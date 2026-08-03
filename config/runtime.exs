@@ -286,6 +286,21 @@ config :ethereum_jsonrpc, EthereumJSONRPC.HTTP,
   gzip_enabled?: ConfigHelper.parse_bool_env_var("ETHEREUM_JSONRPC_HTTP_GZIP_ENABLED", "false"),
   batch_size: ConfigHelper.parse_integer_env_var("ETHEREUM_JSONRPC_HTTP_BATCH_SIZE", 500)
 
+firehose_endpoint = System.get_env("FIREHOSE_ENDPOINT")
+firehose_api_key = System.get_env("FIREHOSE_API_KEY")
+
+if firehose_endpoint in [nil, ""] != firehose_api_key in [nil, ""] do
+  raise "FIREHOSE_ENDPOINT and FIREHOSE_API_KEY must be configured together"
+end
+
+firehose_url =
+  if firehose_endpoint in [nil, ""], do: nil, else: "http://127.0.0.1:8082/v1/blocks"
+
+# Firehose runs as a co-located sidecar with fixed internal networking and timeout settings.
+config :ethereum_jsonrpc, EthereumJSONRPC.Firehose,
+  url: firehose_url,
+  http_options: [pool: :ethereum_jsonrpc, recv_timeout: 60_000, timeout: 60_000]
+
 config :ethereum_jsonrpc, EthereumJSONRPC.Geth,
   block_traceable?: ConfigHelper.parse_bool_env_var("ETHEREUM_JSONRPC_GETH_TRACE_BY_BLOCK"),
   allow_empty_traces?: ConfigHelper.parse_bool_env_var("ETHEREUM_JSONRPC_GETH_ALLOW_EMPTY_TRACES"),
@@ -1105,6 +1120,9 @@ config :indexer,
   fetcher_init_limit: ConfigHelper.parse_integer_env_var("INDEXER_FETCHER_INIT_QUERY_LIMIT", 100),
   fetcher_init_delay: ConfigHelper.parse_time_env_var("INDEXER_FETCHER_INIT_DELAY", "10m"),
   massive_block_threshold: ConfigHelper.parse_integer_env_var("INDEXER_MASSIVE_BLOCK_THRESHOLD", 1000),
+  # Backs the catchup (backfill) pipeline with a Firehose sidecar instead of the JSONRPC node.
+  # Realtime keeps following the head over JSONRPC either way.
+  source: if(firehose_url, do: EthereumJSONRPC.Firehose),
   token_balances_fetcher_init_limit:
     ConfigHelper.parse_integer_env_var("INDEXER_TOKEN_BALANCES_FETCHER_INIT_QUERY_LIMIT", 100_000),
   coin_balances_fetcher_init_limit:

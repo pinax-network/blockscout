@@ -1,0 +1,5 @@
+.env
+node_modules/
+
+# the repo root ignores *.env.example; this one is documentation and must be tracked
+!.env.example

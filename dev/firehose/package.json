@@ -1,0 +1,16 @@
+{
+  "name": "blockscout-firehose-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Firehose gRPC -> Blockscout JSON sidecar",
+  "main": "firehose-sidecar.js",
+  "scripts": {
+    "test": "node --test firehose-sidecar.test.js",
+    "verify:traces": "node trace-parity.js"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.0",
+    "@grpc/proto-loader": "^0.7.13",
+    "protobufjs": "^7.4.0"
+  }
+}

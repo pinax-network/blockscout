@@ -433,7 +433,17 @@ defmodule Indexer.Fetcher.InternalTransaction do
     end
   end
 
-  defp mark_failed_transactions(internal_transactions_params) do
+  @doc """
+  Propagates revert state down each call tree.
+
+  Any internal transaction with a failed ancestor is stripped of the fields that a reverted call
+  never really produced and is marked `"Parent reverted"`.
+
+  Public so that sources which obtain traces outside this fetcher - `EthereumJSONRPC.Firehose`,
+  routed through `Indexer.Block.Fetcher` - normalize them identically.
+  """
+  @spec mark_failed_transactions([map()]) :: [map()]
+  def mark_failed_transactions(internal_transactions_params) do
     # we store reversed trace addresses for more efficient list head-tail decomposition in has_failed_parent?
     failed_parent_paths =
       internal_transactions_params
