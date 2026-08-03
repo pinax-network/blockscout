@@ -95,7 +95,7 @@ horizontal speedup. True multi-instance backfill needs an atomic range-claim mec
 
 | Family | Status | Notes |
 |---|---|---|
-| Arbitrum Orbit | Supported and end-to-end verified | Selected by native `CHAIN_TYPE=arbitrum`; system calls attach to the explicit ArbOS internal transaction type. |
+| Arbitrum Orbit | Supported with a known fee-cap source gap | Selected by native `CHAIN_TYPE=arbitrum`; system calls attach to the explicit ArbOS internal transaction type. Robinhood Firehose currently omits type-2 maximum fee fields, so the connector preserves effective `gasPrice` and leaves those unavailable fields absent ([issue #4](https://github.com/pinax-network/blockscout/issues/4)). |
 | Ethereum Cancun/Prague | Experimental | Native `CHAIN_TYPE=ethereum` and the default build select this mapping. Header, blob receipt/transaction and EIP-7702 mappings are fixture-tested; production database parity is still required before declaring a deployment certified. |
 | Optimism | Unsupported | Deposit enum is recognized but the protobuf lacks the full node-specific deposit payload. The connector fails closed. |
 | Polygon | Unsupported | State-sync enum is recognized but database and trace-placement parity are unverified. The connector fails closed. |

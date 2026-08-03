@@ -374,17 +374,16 @@ test("compareBlockTraces rejects field drift even when frame counts match", () =
   assert.throws(() => compareBlockTraces(expected, actual, 100), /full callTracer mismatch at block 100/);
 });
 
-test("convertBlock rejects incomplete typed data instead of importing defaults", () => {
+test("convertBlock rejects incomplete Ethereum typed data instead of importing defaults", () => {
+  const incomplete = firehoseBlock(
+    transactionTrace("TRX_TYPE_DYNAMIC_FEE", {
+      maxFeePerGas: undefined,
+      maxPriorityFeePerGas: undefined,
+    })
+  );
+
   assert.throws(
-    () =>
-      convertBlock(
-        firehoseBlock(
-          transactionTrace("TRX_TYPE_DYNAMIC_FEE", {
-            maxFeePerGas: undefined,
-            maxPriorityFeePerGas: undefined,
-          })
-        )
-      ),
+    () => convertBlock(incomplete, "ethereum"),
     /fee-market transaction .* is missing its max fee fields/
   );
   assert.throws(
@@ -399,4 +398,21 @@ test("convertBlock rejects incomplete typed data instead of importing defaults",
     () => convertBlock(firehoseBlock(transactionTrace("TRX_TYPE_FUTURE"))),
     /unsupported Firehose transaction type/
   );
+});
+
+test("convertBlock omits unavailable Arbitrum fee caps without inventing values", () => {
+  const converted = convertBlock(
+    firehoseBlock(
+      transactionTrace("TRX_TYPE_DYNAMIC_FEE", {
+        maxFeePerGas: undefined,
+        maxPriorityFeePerGas: undefined,
+      })
+    ),
+    "arbitrum"
+  );
+  const transaction = converted.block.transactions[0];
+
+  assert.equal(transaction.gasPrice, "0xa");
+  assert.equal(Object.hasOwn(transaction, "maxFeePerGas"), false);
+  assert.equal(Object.hasOwn(transaction, "maxPriorityFeePerGas"), false);
 });

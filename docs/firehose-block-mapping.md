@@ -88,6 +88,12 @@ Arbitrum transaction types matter on Orbit chains: `TRX_TYPE_ARBITRUM_DEPOSIT` =
 `_UNSIGNED` = 101, `_CONTRACT` = 102, `_RETRY` = 104, `_SUBMIT_RETRYABLE` = 105,
 `_INTERNAL` = 106, `_LEGACY` = 120.
 
+Robinhood's Arbitrum extended stream currently omits `max_fee_per_gas` and
+`max_priority_fee_per_gas` for type-2 transactions. The connector keeps the recorded effective
+`gasPrice` and omits those two JSON-RPC keys instead of inventing values; Ethereum typed
+transactions remain fail-closed when either field is missing. The upstream gap is tracked in
+[issue #4](https://github.com/pinax-network/blockscout/issues/4).
+
 Cancun blob transactions map to type `0x3`; Prague `TRX_TYPE_SET_CODE` transactions map to `0x4`.
 Each EIP-7702 authorization emits `chainId`, `address`, `nonce`, `yParity`, `r` and `s`. Firehose's
 derived `authority` and `discarded` metadata are not part of the JSON-RPC transaction object.

@@ -274,7 +274,7 @@ function accessList(entries) {
   }));
 }
 
-function convertBlock(block) {
+function convertBlock(block, chainFamily = CHAIN_FAMILY) {
   const header = block.header || {};
   const number = Number(block.number);
   const blockHash = hex(block.hash);
@@ -282,12 +282,16 @@ function convertBlock(block) {
   const traces = block.transactionTraces || [];
 
   const transactions = traces.map((t) => {
-    if (
-      (t.type === "TRX_TYPE_DYNAMIC_FEE" ||
-        t.type === "TRX_TYPE_BLOB" ||
-        t.type === "TRX_TYPE_SET_CODE") &&
-      (!hasValue(t.maxFeePerGas) || !hasValue(t.maxPriorityFeePerGas))
-    ) {
+    const feeMarketTransaction =
+      t.type === "TRX_TYPE_DYNAMIC_FEE" ||
+      t.type === "TRX_TYPE_BLOB" ||
+      t.type === "TRX_TYPE_SET_CODE";
+    const hasFeeCaps = hasValue(t.maxFeePerGas) && hasValue(t.maxPriorityFeePerGas);
+
+    // The Robinhood Arbitrum Firehose currently omits both fee-cap fields even though its RPC
+    // exposes them. They cannot be derived from the effective gas price, so leave them absent
+    // instead of inventing values. Ethereum keeps the strict completeness guarantee.
+    if (feeMarketTransaction && !hasFeeCaps && chainFamily !== "arbitrum") {
       throw new Error(`fee-market transaction ${hex(t.hash)} is missing its max fee fields`);
     }
 
@@ -302,14 +306,17 @@ function convertBlock(block) {
       value: bigIntQty(t.value),
       gas: qty(t.gasLimit),
       gasPrice: bigIntQty(t.gasPrice),
-      maxFeePerGas: bigIntQty(t.maxFeePerGas),
-      maxPriorityFeePerGas: bigIntQty(t.maxPriorityFeePerGas),
       input: hex(t.input),
       type: qty(typeNumber(t.type)),
       v: qtyBytes(t.v),
       r: qtyBytes(t.r),
       s: qtyBytes(t.s),
     };
+
+    if (hasFeeCaps) {
+      transaction.maxFeePerGas = bigIntQty(t.maxFeePerGas);
+      transaction.maxPriorityFeePerGas = bigIntQty(t.maxPriorityFeePerGas);
+    }
 
     if (
       t.type === "TRX_TYPE_ACCESS_LIST" ||
