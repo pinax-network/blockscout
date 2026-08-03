@@ -20,6 +20,7 @@ permissions:
 
 jobs:
   push_to_registry:
+    if: github.repository == 'blockscout/blockscout'
     name: Push Docker image to GitHub Container Registry
     runs-on: build
     steps:
