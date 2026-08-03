@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LicenseRef-Blockscout
 defmodule Explorer.SmartContract.Solidity.VerifierTest do
-  use ExUnit.Case, async: true
+  # These tests mutate the global Tesla adapter and use the singleton SolcDownloader.
+  use ExUnit.Case, async: false
   use Explorer.DataCase
 
   use Utils.CompileTimeEnvHelper, chain_type: [:explorer, :chain_type]
