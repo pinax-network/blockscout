@@ -187,6 +187,81 @@ defmodule EthereumJSONRPC.FirehoseTest do
       assert Enum.all?(coin_balances, &match?(%DateTime{}, &1.value_fetched_at))
     end
 
+    test "preserves Cancun block and blob transaction fields through the existing parsers" do
+      blob_hash = "0x01" <> String.duplicate("00", 31)
+
+      blob_entry =
+        entry(64)
+        |> put_in(["block", "withdrawalsRoot"], "0x02" <> String.duplicate("00", 31))
+        |> put_in(["block", "blobGasUsed"], "0x20000")
+        |> put_in(["block", "excessBlobGas"], "0x40000")
+        |> update_in(["block", "transactions", Access.at(0)], fn transaction ->
+          Map.merge(transaction, %{
+            "type" => "0x3",
+            "maxPriorityFeePerGas" => "0x2",
+            "maxFeePerGas" => "0x14",
+            "maxFeePerBlobGas" => "0x3e8",
+            "blobVersionedHashes" => [blob_hash]
+          })
+        end)
+        |> update_in(["receipts", Access.at(0)], fn receipt ->
+          Map.merge(receipt, %{"type" => "0x3", "blobGasUsed" => "0x20000", "blobGasPrice" => "0x19"})
+        end)
+
+      stub_sidecar([blob_entry])
+
+      assert {:ok, %{blocks: blocks, receipts: %{receipts: [receipt_params]}}} = Firehose.fetch_range(64..64)
+      assert %Blocks{blocks_params: [block_params], transactions_params: [transaction_params]} = blocks
+
+      assert transaction_params.type == 3
+
+      # These fields are compile-time gated to CHAIN_TYPE=ethereum. The standalone
+      # ethereum_jsonrpc test app has no chain type, while the Ethereum build and CI matrix do.
+      if Map.has_key?(block_params, :withdrawals_root) do
+        assert block_params.withdrawals_root == "0x02" <> String.duplicate("00", 31)
+        assert block_params.blob_gas_used == 0x20000
+        assert block_params.excess_blob_gas == 0x40000
+        assert transaction_params.max_fee_per_blob_gas == 1000
+        assert transaction_params.blob_versioned_hashes == [blob_hash]
+        assert receipt_params.blob_gas_used == 0x20000
+        assert receipt_params.blob_gas_price == 25
+      end
+    end
+
+    test "preserves Prague EIP-7702 authorization tuples through the existing parser" do
+      delegate = "0x0000000000000000000000000000000000000005"
+
+      set_code_entry =
+        update_in(entry(64), ["block", "transactions", Access.at(0)], fn transaction ->
+          Map.merge(transaction, %{
+            "type" => "0x4",
+            "maxPriorityFeePerGas" => "0x2",
+            "maxFeePerGas" => "0x14",
+            "authorizationList" => [
+              %{
+                "chainId" => "0x1",
+                "address" => delegate,
+                "nonce" => "0x9",
+                "yParity" => "0x1",
+                "r" => "0x6",
+                "s" => "0x7"
+              }
+            ]
+          })
+        end)
+
+      stub_sidecar([set_code_entry])
+
+      assert {:ok, %{blocks: %Blocks{transactions_params: [transaction_params]}}} =
+               Firehose.fetch_range(64..64)
+
+      assert transaction_params.type == 4
+
+      assert transaction_params.authorization_list == [
+               %{chain_id: 1, address: delegate, nonce: 9, v: 1, r: 6, s: 7}
+             ]
+    end
+
     test "omits coin balances when the sidecar reports none" do
       stub_sidecar([Map.delete(entry(64), "balanceChanges")])
 

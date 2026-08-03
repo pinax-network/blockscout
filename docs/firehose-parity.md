@@ -13,16 +13,19 @@ Two levels:
 ## Frame-level
 
 For each block, pull `debug_traceBlockByNumber(callTracer)` from an archive node and the same range
-from the connector, flatten both call trees to `(depth, type, from, to)` and compare as multisets.
-Any surplus on the RPC side is a frame the connector is dropping.
+from the connector. `dev/firehose/trace-parity.js` flattens both trees in call order and compares
+each transaction's frames at their derived `traceAddress`, including `type`, `from`, `to`, `value`,
+`gas`, `gasUsed`, `input`, `output`, and `error`.
 
 This is what surfaced all three mapping subtleties in
-[firehose-block-mapping.md](firehose-block-mapping.md). Counting only totals hides them — the
+[firehose-block-mapping.md](firehose-block-mapping.md). Counting only totals or a subset of frame
+fields hides drift — the
 `system_calls` gap was a steady 2 frames per block, and the `suicide` gap was 100 frames
 concentrated in a *single* block out of 100. A total-only check would read as "99% correct" while
 one block was badly wrong.
 
-**Current result** — Robinhood Chain, blocks 25899000–25899099:
+**Historical frame-count result** — Robinhood Chain, blocks 25899000–25899099. This predates the
+strict all-field verifier above and must not be read as full-field certification:
 
 ```
 blocks=100  rpc_frames=8567  firehose_frames=8567  delta=0
@@ -114,7 +117,7 @@ Interpretation caveats, both of which understate the Firehose advantage:
 
 ```bash
 # connector
-cd dev/firehose && npm install
+cd dev/firehose && npm ci
 FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> PORT=8082 FIREHOSE_WORKERS=8 \
   node firehose-sidecar.js
 
@@ -132,10 +135,19 @@ mix run --no-halt
 Then compare with `dev/firehose/verify.sql`, which emits row counts and a stable fingerprint of
 blocks, transactions and internal transactions for direct diffing between runs.
 
+Run the strict frame-level comparison independently:
+
+```bash
+cd dev/firehose
+RPC_URL=<archive-rpc> FIREHOSE_URL=http://127.0.0.1:8082/v1/blocks \
+  START_BLOCK=<first> END_BLOCK=<last> npm run verify:traces
+```
+
 ## Open items
 
 - **CREATE2** is recorded as `:create`. `sf.ethereum.type.v2.CallType` has no `CREATE2` member.
 - **Zero-value selfdestruct beneficiaries** are unrecoverable — no balance moved, so Firehose
   records no refund to attribute.
-- Parity is verified on **Arbitrum Orbit**. Other chain families will have their own system-call
-  conventions and should be re-validated frame-by-frame before use.
+- End-to-end parity is verified on **Arbitrum Orbit**. Ethereum Cancun/Prague field mapping has
+  fixture coverage but still requires a recorded RPC-vs-Firehose database comparison before a
+  deployment is certified. Optimism and Polygon remain fail-closed and unsupported.

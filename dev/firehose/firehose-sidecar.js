@@ -39,6 +39,8 @@ const protobuf = require("protobufjs");
 const ENDPOINT = process.env.FIREHOSE_ENDPOINT || "localhost:10015";
 const PORT = parseInt(process.env.PORT || "8081", 10);
 const PLAINTEXT = process.env.FIREHOSE_PLAINTEXT === "true";
+const CHAIN_FAMILY = process.env.FIREHOSE_CHAIN_FAMILY || "arbitrum";
+const SUPPORTED_CHAIN_FAMILIES = new Set(["arbitrum", "ethereum"]);
 
 // Firehose providers authenticate in one of two ways. Pinax and StreamingFast's hosted endpoints
 // take a long-lived key in `x-api-key`; deployments fronted by StreamingFast's auth service take a
@@ -101,6 +103,8 @@ const qty = (n) => "0x" + BigInt(n || 0).toString(16);
 const qtyBytes = (b) => (b && b.length ? "0x" + BigInt("0x" + Buffer.from(b).toString("hex")).toString(16) : "0x0");
 // fixed-width data fields, e.g. the block's 8-byte nonce
 const hexPadded = (n, bytes) => "0x" + BigInt(n || 0).toString(16).padStart(bytes * 2, "0");
+const hasBytes = (b) => b && b.length;
+const hasValue = (value) => value !== undefined && value !== null;
 
 // BigInt messages carry a big-endian two's complement byte string.
 function bigIntQty(msg) {
@@ -248,6 +252,30 @@ function coinBalances(block) {
   return [...final].map(([address, v]) => ({ address, value: v.value }));
 }
 
+function authorizationList(authorizations) {
+  return (authorizations || []).map((authorization, index) => {
+    if (!hasBytes(authorization.address)) {
+      throw new Error(`set-code authorization ${index} is missing its delegate address`);
+    }
+
+    return {
+      chainId: qtyBytes(authorization.chainId),
+      address: addr(authorization.address),
+      nonce: qty(authorization.nonce),
+      yParity: qty(authorization.v),
+      r: qtyBytes(authorization.r),
+      s: qtyBytes(authorization.s),
+    };
+  });
+}
+
+function accessList(entries) {
+  return (entries || []).map((entry) => ({
+    address: addr(entry.address) || EMPTY,
+    storageKeys: (entry.storageKeys || []).map(hex),
+  }));
+}
+
 function convertBlock(block) {
   const header = block.header || {};
   const number = Number(block.number);
@@ -255,25 +283,59 @@ function convertBlock(block) {
   const blockNumberHex = qty(number);
   const traces = block.transactionTraces || [];
 
-  const transactions = traces.map((t) => ({
-    hash: hex(t.hash),
-    nonce: qty(t.nonce),
-    blockHash,
-    blockNumber: blockNumberHex,
-    transactionIndex: qty(t.index),
-    from: addr(t.from) || EMPTY,
-    to: addr(t.to),
-    value: bigIntQty(t.value),
-    gas: qty(t.gasLimit),
-    gasPrice: bigIntQty(t.gasPrice),
-    maxFeePerGas: bigIntQty(t.maxFeePerGas),
-    maxPriorityFeePerGas: bigIntQty(t.maxPriorityFeePerGas),
-    input: hex(t.input),
-    type: qty(typeNumber(t.type)),
-    v: qtyBytes(t.v),
-    r: qtyBytes(t.r),
-    s: qtyBytes(t.s),
-  }));
+  const transactions = traces.map((t) => {
+    if (
+      (t.type === "TRX_TYPE_DYNAMIC_FEE" ||
+        t.type === "TRX_TYPE_BLOB" ||
+        t.type === "TRX_TYPE_SET_CODE") &&
+      (!hasValue(t.maxFeePerGas) || !hasValue(t.maxPriorityFeePerGas))
+    ) {
+      throw new Error(`fee-market transaction ${hex(t.hash)} is missing its max fee fields`);
+    }
+
+    const transaction = {
+      hash: hex(t.hash),
+      nonce: qty(t.nonce),
+      blockHash,
+      blockNumber: blockNumberHex,
+      transactionIndex: qty(t.index),
+      from: addr(t.from) || EMPTY,
+      to: addr(t.to),
+      value: bigIntQty(t.value),
+      gas: qty(t.gasLimit),
+      gasPrice: bigIntQty(t.gasPrice),
+      maxFeePerGas: bigIntQty(t.maxFeePerGas),
+      maxPriorityFeePerGas: bigIntQty(t.maxPriorityFeePerGas),
+      input: hex(t.input),
+      type: qty(typeNumber(t.type)),
+      v: qtyBytes(t.v),
+      r: qtyBytes(t.r),
+      s: qtyBytes(t.s),
+    };
+
+    if (
+      t.type === "TRX_TYPE_ACCESS_LIST" ||
+      t.type === "TRX_TYPE_DYNAMIC_FEE" ||
+      t.type === "TRX_TYPE_BLOB" ||
+      t.type === "TRX_TYPE_SET_CODE"
+    ) {
+      transaction.accessList = accessList(t.accessList);
+    }
+
+    if (t.type === "TRX_TYPE_BLOB") {
+      if (!hasValue(t.blobGasFeeCap) || !(t.blobHashes || []).length) {
+        throw new Error(`blob transaction ${hex(t.hash)} is missing its blob fee cap or versioned hashes`);
+      }
+      transaction.maxFeePerBlobGas = bigIntQty(t.blobGasFeeCap);
+      transaction.blobVersionedHashes = t.blobHashes.map(hex);
+    }
+
+    if (t.type === "TRX_TYPE_SET_CODE") {
+      transaction.authorizationList = authorizationList(t.setCodeAuthorizations);
+    }
+
+    return transaction;
+  });
 
   const receipts = traces.map((t) => {
     const receipt = t.receipt || {};
@@ -283,7 +345,7 @@ function convertBlock(block) {
         ? (t.calls || []).find((c) => c.callType === "CREATE" && Number(c.parentIndex || 0) === 0)
         : null;
 
-    return {
+    const converted = {
       transactionHash: hex(t.hash),
       transactionIndex: qty(t.index),
       blockHash,
@@ -311,64 +373,89 @@ function convertBlock(block) {
         removed: false,
       })),
     };
+
+    if (t.type === "TRX_TYPE_BLOB") {
+      if (!hasValue(receipt.blobGasUsed) || !hasValue(receipt.blobGasPrice)) {
+        throw new Error(`blob receipt ${hex(t.hash)} is missing blob gas usage or price`);
+      }
+      converted.blobGasUsed = qty(receipt.blobGasUsed);
+      converted.blobGasPrice = bigIntQty(receipt.blobGasPrice);
+    }
+
+    return converted;
   });
 
-  // Block-level system calls are not attached to any TransactionTrace, but a node's callTracer
-  // reports them nested inside the chain's system transaction - on Arbitrum that is the ArbOS
-  // internal transaction, always index 0. Without this they are silently missing: on Robinhood
-  // that was 2 internal transactions per block, ~2.5% of the total.
+  // Block-level system calls are not attached to any TransactionTrace. Arbitrum exposes them
+  // through callTracer under its ArbOS internal transaction, so attach by transaction type rather
+  // than assuming index 0. Ethereum's Cancun/Prague protocol calls have no transaction and are not
+  // returned by debug_traceBlockByNumber, so they deliberately remain outside `callTraces`.
   const systemFrame = buildCallTree(block.systemCalls);
+  const systemTransactions = traces.filter(isSystemTransaction);
+  if (systemFrame && systemTransactions.length > 1) {
+    throw new Error(`block ${number} has multiple Arbitrum system transactions`);
+  }
+  const systemTransaction = systemTransactions[0];
 
   const callTraces = traces.map((t) => {
     const result = buildCallTree(t.calls);
     if (!result) throw new Error(`transaction ${hex(t.hash)} has no call trace`);
-    if (systemFrame && isSystemTransaction(t)) {
+    if (systemFrame && t === systemTransaction) {
       (result.calls = result.calls || []).push(systemFrame);
     }
     return { txHash: hex(t.hash), result };
   });
 
+  const convertedBlock = {
+    hash: blockHash,
+    number: blockNumberHex,
+    parentHash: hex(header.parentHash),
+    sha3Uncles: hex(header.uncleHash),
+    miner: addr(header.coinbase) || EMPTY,
+    stateRoot: hex(header.stateRoot),
+    transactionsRoot: hex(header.transactionsRoot),
+    receiptsRoot: hex(header.receiptRoot),
+    logsBloom: hex(header.logsBloom),
+    difficulty: bigIntQty(header.difficulty),
+    totalDifficulty: bigIntQty(header.totalDifficulty),
+    gasLimit: qty(header.gasLimit),
+    gasUsed: qty(header.gasUsed),
+    timestamp: qty(timestampSeconds(header.timestamp)),
+    extraData: hex(header.extraData),
+    mixHash: hex(header.mixHash),
+    nonce: hexPadded(header.nonce, 8),
+    baseFeePerGas: header.baseFeePerGas ? bigIntQty(header.baseFeePerGas) : undefined,
+    size: qty(block.size),
+    uncles: (block.uncles || []).map((uncle) => hex(uncle.hash)),
+    withdrawals: (block.withdrawals || []).map((w) => ({
+      index: qty(w.index),
+      validatorIndex: qty(w.validatorIndex),
+      address: addr(w.address) || EMPTY,
+      amount: qty(w.amount),
+    })),
+    transactions,
+  };
+
+  if (hasBytes(header.withdrawalsRoot)) convertedBlock.withdrawalsRoot = hex(header.withdrawalsRoot);
+  if (hasValue(header.blobGasUsed)) convertedBlock.blobGasUsed = qty(header.blobGasUsed);
+  if (hasValue(header.excessBlobGas)) convertedBlock.excessBlobGas = qty(header.excessBlobGas);
+  if (hasBytes(header.parentBeaconRoot)) {
+    convertedBlock.parentBeaconBlockRoot = hex(header.parentBeaconRoot);
+  }
+  if (hasBytes(header.requestsHash)) convertedBlock.requestsHash = hex(header.requestsHash);
+
   return {
     number,
-    block: {
-      hash: blockHash,
-      number: blockNumberHex,
-      parentHash: hex(header.parentHash),
-      sha3Uncles: hex(header.uncleHash),
-      miner: addr(header.coinbase) || EMPTY,
-      stateRoot: hex(header.stateRoot),
-      transactionsRoot: hex(header.transactionsRoot),
-      receiptsRoot: hex(header.receiptRoot),
-      logsBloom: hex(header.logsBloom),
-      difficulty: bigIntQty(header.difficulty),
-      totalDifficulty: bigIntQty(header.totalDifficulty),
-      gasLimit: qty(header.gasLimit),
-      gasUsed: qty(header.gasUsed),
-      timestamp: qty(timestampSeconds(header.timestamp)),
-      extraData: hex(header.extraData),
-      mixHash: hex(header.mixHash),
-      nonce: hexPadded(header.nonce, 8),
-      baseFeePerGas: header.baseFeePerGas ? bigIntQty(header.baseFeePerGas) : undefined,
-      size: qty(block.size),
-      uncles: [],
-      withdrawals: (block.withdrawals || []).map((w) => ({
-        index: qty(w.index),
-        validatorIndex: qty(w.validatorIndex),
-        address: addr(w.address) || EMPTY,
-        amount: qty(w.amount),
-      })),
-      transactions,
-    },
+    block: convertedBlock,
     receipts,
     traces: callTraces,
     balanceChanges: coinBalances(block),
   };
 }
 
-// The chain's own bookkeeping transaction, which is where a node's tracer hangs the block's
-// system calls. On Arbitrum it is the ArbOS internal transaction at index 0.
+// Arbitrum's bookkeeping transaction is where its node tracer hangs block-level system calls.
+// Match the explicit type: index 0 is conventional but not part of the protobuf contract.
 function isSystemTransaction(t) {
-  return Number(t.index || 0) === 0 && t.type === "TRX_TYPE_ARBITRUM_INTERNAL";
+  return t.type === "TRX_TYPE_ARBITRUM_INTERNAL";
 }
 
 function typeNumber(type) {
@@ -381,6 +468,8 @@ function typeNumber(type) {
       return 2;
     case "TRX_TYPE_BLOB":
       return 3;
+    case "TRX_TYPE_SET_CODE":
+      return 4;
     case "TRX_TYPE_ARBITRUM_DEPOSIT":
       return 100;
     case "TRX_TYPE_ARBITRUM_UNSIGNED":
@@ -395,8 +484,46 @@ function typeNumber(type) {
       return 106;
     case "TRX_TYPE_ARBITRUM_LEGACY":
       return 120;
+    case "TRX_TYPE_OPTIMISM_DEPOSIT":
+      return 126;
+    case "TRX_TYPE_POLYGON_STATE_SYNC":
+      return 200;
     default:
-      return 0;
+      throw new Error(`unsupported Firehose transaction type ${type}`);
+  }
+}
+
+function validateBlockFamily(block, chainFamily = CHAIN_FAMILY) {
+  if (!SUPPORTED_CHAIN_FAMILIES.has(chainFamily)) {
+    throw new Error(
+      `unsupported FIREHOSE_CHAIN_FAMILY ${chainFamily}; supported values are arbitrum and ethereum`
+    );
+  }
+
+  const traces = block.transactionTraces || [];
+  const familySpecific = traces.find((trace) => {
+    if (trace.type.startsWith("TRX_TYPE_ARBITRUM_")) return chainFamily !== "arbitrum";
+    if (trace.type === "TRX_TYPE_OPTIMISM_DEPOSIT") return true;
+    if (trace.type === "TRX_TYPE_POLYGON_STATE_SYNC") return true;
+    return false;
+  });
+
+  if (familySpecific) {
+    throw new Error(
+      `transaction ${hex(familySpecific.hash)} has ${familySpecific.type}, which is not supported for ` +
+        `FIREHOSE_CHAIN_FAMILY=${chainFamily}`
+    );
+  }
+
+  if (
+    chainFamily === "arbitrum" &&
+    (block.systemCalls || []).length &&
+    !traces.some(isSystemTransaction)
+  ) {
+    throw new Error(
+      `block ${block.number} has system calls but no Arbitrum internal transaction; ` +
+        `check FIREHOSE_CHAIN_FAMILY`
+    );
   }
 }
 
@@ -426,6 +553,7 @@ function fetchRange(startBlock, endBlock) {
           bytes: Buffer,
           defaults: true,
         });
+        validateBlockFamily(block);
         out.push(convertBlock(block));
       } catch (e) {
         stream.cancel();
@@ -499,6 +627,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       endpoint: ENDPOINT,
       source: "firehose",
+      chainFamily: CHAIN_FAMILY,
       auth: API_KEY ? "api-key" : BEARER_TOKEN ? "bearer" : "none",
     });
   }
@@ -542,6 +671,31 @@ function countFrames(frame) {
   return 1 + (frame.calls || []).reduce((a, c) => a + countFrames(c), 0);
 }
 
+// Canonical frame representation used by the parity tool. The path is the callTracer-derived
+// trace address Blockscout ultimately stores, so comparisons catch ordering/nesting drift as well
+// as value, gas, result and error differences.
+function flattenTrace(frame, traceAddress = [], out = []) {
+  if (!frame) return out;
+
+  out.push({
+    traceAddress,
+    type: frame.type,
+    from: frame.from,
+    to: frame.to,
+    value: frame.value || "0x0",
+    gas: frame.gas || "0x0",
+    gasUsed: frame.gasUsed || "0x0",
+    input: frame.input || "0x",
+    output: frame.output || "0x",
+    error: frame.error || null,
+  });
+
+  for (const [index, child] of (frame.calls || []).entries()) {
+    flattenTrace(child, [...traceAddress, index], out);
+  }
+  return out;
+}
+
 // Decoding protobuf and re-encoding it as JSON is CPU-bound, and it pins one core: with a single
 // process the sidecar tops out around 16 blocks/s no matter how many ranges Blockscout requests
 // concurrently, which makes it - not Firehose - the bottleneck. Fork one worker per core and let
@@ -549,6 +703,12 @@ function countFrames(frame) {
 const WORKERS = parseInt(process.env.FIREHOSE_WORKERS || String(Math.max(1, os.cpus().length - 2)), 10);
 
 function start() {
+  if (!SUPPORTED_CHAIN_FAMILIES.has(CHAIN_FAMILY)) {
+    throw new Error(
+      `unsupported FIREHOSE_CHAIN_FAMILY ${CHAIN_FAMILY}; supported values are arbitrum and ethereum`
+    );
+  }
+
   if (cluster.isPrimary && !API_KEY && !BEARER_TOKEN) {
     console.warn(
       `[firehose] WARNING: neither FIREHOSE_API_KEY nor FIREHOSE_BEARER_TOKEN is set - requests to ` +
@@ -575,4 +735,11 @@ function start() {
 
 if (require.main === module) start();
 
-module.exports = { coinBalances, convertBlock, start, validateFetchedRange };
+module.exports = {
+  coinBalances,
+  convertBlock,
+  flattenTrace,
+  start,
+  validateBlockFamily,
+  validateFetchedRange,
+};

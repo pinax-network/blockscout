@@ -60,6 +60,10 @@ Protobuf omits default values, so a decoder must fill them (`parentIndex` absent
 | `mixHash` | `header.mix_hash` |
 | `nonce` | `header.nonce`, **padded to 8 bytes** |
 | `baseFeePerGas` | `header.base_fee_per_gas` |
+| `withdrawalsRoot` | `header.withdrawals_root` |
+| `blobGasUsed` / `excessBlobGas` | same-named optional Cancun header fields |
+| `parentBeaconBlockRoot` | `header.parent_beacon_root` |
+| `requestsHash` | `header.requests_hash` (Prague) |
 | `uncles` | `Block.uncles` |
 | `withdrawals` | `Block.withdrawals` |
 | `transactions` | from `Block.transaction_traces`, below |
@@ -75,10 +79,23 @@ Protobuf omits default values, so a decoder must fill them (`parentIndex` absent
 | `blockHash` / `blockNumber` | from the enclosing block |
 | `type` | `Type` enum → numeric (see below) |
 | `v` / `r` / `s` | same-named — **quantity encoding** |
+| `accessList` | `access_list`, including every storage key |
+| `maxFeePerBlobGas` | `blob_gas_fee_cap` (type 3) |
+| `blobVersionedHashes` | `blob_hashes` (type 3) |
+| `authorizationList` | `set_code_authorizations` signature tuple fields (type 4) |
 
 Arbitrum transaction types matter on Orbit chains: `TRX_TYPE_ARBITRUM_DEPOSIT` = 100,
 `_UNSIGNED` = 101, `_CONTRACT` = 102, `_RETRY` = 104, `_SUBMIT_RETRYABLE` = 105,
 `_INTERNAL` = 106, `_LEGACY` = 120.
+
+Cancun blob transactions map to type `0x3`; Prague `TRX_TYPE_SET_CODE` transactions map to `0x4`.
+Each EIP-7702 authorization emits `chainId`, `address`, `nonce`, `yParity`, `r` and `s`. Firehose's
+derived `authority` and `discarded` metadata are not part of the JSON-RPC transaction object.
+
+The Optimism deposit (`0x7e`) and Polygon state-sync (`0xc8`) enum values are recognized so they
+can never silently fall back to legacy type `0x0`. Those chain families remain runtime-blocked:
+the current protobuf does not carry all node-specific deposit fields and they do not yet have
+end-to-end Blockscout database parity.
 
 ## Receipts → `eth_getBlockReceipts`
 
@@ -94,6 +111,7 @@ Arbitrum transaction types matter on Orbit chains: `TRX_TYPE_ARBITRUM_DEPOSIT` =
 | `status` | `TransactionTrace.status` — `SUCCEEDED` → `0x1`, else `0x0` |
 | `blockHash` / `blockNumber` | enclosing block |
 | `contractAddress` | `address` of the top-level `CREATE` call, when `to` is empty |
+| `blobGasUsed` / `blobGasPrice` | same-named `TransactionReceipt` fields (type 3) |
 
 ### Logs
 
@@ -141,8 +159,13 @@ diffing frame-by-frame; see [firehose-parity.md](firehose-parity.md).
 **1. `Block.system_calls` — outside `transaction_traces` entirely.**
 Chain-level system operations live in their own top-level field. A node's tracer reports them
 nested inside the chain's system transaction (on Arbitrum, the ArbOS internal transaction at index
-0, type `TRX_TYPE_ARBITRUM_INTERNAL`). They form their own `index`/`parent_index` tree. Ignoring
+0 by convention, type `TRX_TYPE_ARBITRUM_INTERNAL`). The connector locates that transaction by
+type rather than assuming its position. They form their own `index`/`parent_index` tree. Ignoring
 them cost 2 internal transactions per block — ~2.5% of the total on Robinhood Chain.
+
+Ethereum Cancun/Prague protocol system calls have no transaction and are not returned by
+`debug_traceBlockByNumber`, so they are deliberately not attached to a user transaction. Their
+committed balance effects are still included in `balanceChanges`.
 
 **2. `Call.suicide` is one Firehose call but two tracer frames.**
 Firehose flags the self-destructing contract with `suicide: true` on the call that created or
@@ -167,10 +190,12 @@ calls?`. A create2 is therefore indistinguishable from a create and Blockscout r
 - [ ] `v`/`r`/`s` empty → `0x0`; Blockscout runs these through `quantity_to_integer/1`, which
       rejects a bare `"0x"`
 - [ ] block `nonce` padded to 8 bytes
+- [ ] optional fork fields emitted only when present; never substitute zero for an absent field
 - [ ] `logIndex` from `blockIndex`, not `index`
 - [ ] `status`/`gasUsed` come off the trace, not the receipt
 - [ ] `receipt_root` is singular in the schema, `receiptsRoot` in JSON-RPC
 - [ ] a receipt for **every** transaction — Blockscout looks them up with `Map.fetch!/2` and will
       raise on a missing one
-- [ ] `Block.system_calls` attached to the system transaction
+- [ ] Arbitrum `Block.system_calls` attached to the explicit ArbOS system transaction
 - [ ] `Call.suicide` expanded into a second frame
+- [ ] unknown and unsupported chain-specific transaction types fail the range instead of becoming legacy

@@ -20,6 +20,11 @@ Realtime is unaffected — it keeps following the head over JSON-RPC, where its 
 | `INDEXER_FIREHOSE_URL` | Sidecar endpoint. Unset (default) = stock JSON-RPC behaviour. |
 | `INDEXER_FIREHOSE_TIMEOUT` | Request timeout, default `60s`. |
 
+The sidecar also requires a mapping policy. `FIREHOSE_CHAIN_FAMILY` defaults to `arbitrum` for the
+original Orbit deployment. Set it to `ethereum` explicitly for experimental Cancun/Prague support.
+Optimism and Polygon currently fail closed because their end-to-end database parity is not
+certified and the protobuf lacks the complete Optimism deposit payload.
+
 ## Sidecar contract
 
 `EthereumJSONRPC.Firehose` posts
@@ -81,7 +86,8 @@ ranges and duplicate the work.
 Or pass them inline:
 
 ```bash
-FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> PORT=8082 FIREHOSE_WORKERS=8 \
+FIREHOSE_ENDPOINT=<host>:443 FIREHOSE_API_KEY=<key> FIREHOSE_CHAIN_FAMILY=arbitrum \
+  PORT=8082 FIREHOSE_WORKERS=8 \
   node firehose-sidecar.js
 ```
 
@@ -99,6 +105,18 @@ Firehose endpoints require auth — set `FIREHOSE_API_KEY` (sent as `x-api-key`)
   archive RPC. This does not affect the block/receipt/trace backfill path, but it means Blockscout
   still needs a node for its on-demand and token fetchers.
 - **Pending transactions** are not in Firehose, since they are not in blocks.
+
+## Full trace parity check
+
+The parity command compares every call frame by transaction and derived trace address, including
+`type`, `from`, `to`, `value`, `gas`, `gasUsed`, `input`, `output`, and `error`:
+
+```bash
+RPC_URL=<archive-rpc> FIREHOSE_URL=http://127.0.0.1:8082/v1/blocks \
+  START_BLOCK=25899000 END_BLOCK=25899099 npm run verify:traces
+```
+
+A frame-count match alone is not accepted as parity.
 
 ## Running the local end-to-end test
 

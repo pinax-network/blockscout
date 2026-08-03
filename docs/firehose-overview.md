@@ -67,6 +67,7 @@ next to the connector is read automatically; real environment variables take pre
 | `FIREHOSE_ENDPOINT` | `host:port` of the Firehose gRPC endpoint |
 | `FIREHOSE_API_KEY` | Long-lived key, sent as `x-api-key`. Pinax / StreamingFast hosted endpoints. |
 | `FIREHOSE_BEARER_TOKEN` | Short-lived JWT, sent as `authorization: bearer <token>`. Deployments behind StreamingFast's auth service. |
+| `FIREHOSE_CHAIN_FAMILY` | Mapping policy: `arbitrum` (default) or experimental `ethereum` |
 | `FIREHOSE_WORKERS` | Worker processes; defaults to `cores - 2` |
 | `PORT` | HTTP listen port, default `8081` |
 | `FIREHOSE_PLAINTEXT` | `true` for a non-TLS endpoint |
@@ -76,7 +77,7 @@ next to the connector is read automatically; real environment variables take pre
 neither is present, and `GET /health` reports which mode is active:
 
 ```json
-{"ok": true, "endpoint": "...", "source": "firehose", "auth": "api-key"}
+{"ok": true, "endpoint": "...", "source": "firehose", "chainFamily": "arbitrum", "auth": "api-key"}
 ```
 
 ### Scaling catchup
@@ -99,6 +100,18 @@ ranges, producing duplicate Firehose streams and duplicate import attempts rathe
 horizontal speedup. True multi-instance backfill needs an atomic range-claim mechanism.
 
 ## Scope and limits
+
+### Chain-family support
+
+| Family | Status | Notes |
+|---|---|---|
+| Arbitrum Orbit | Supported and end-to-end verified | Default; system calls attach to the explicit ArbOS internal transaction type. |
+| Ethereum Cancun/Prague | Experimental, explicit opt-in | Header, blob receipt/transaction and EIP-7702 mappings are fixture-tested. Set `FIREHOSE_CHAIN_FAMILY=ethereum`; production database parity is still required before declaring a deployment certified. |
+| Optimism | Unsupported | Deposit enum is recognized but the protobuf lacks the full node-specific deposit payload. The connector fails closed. |
+| Polygon | Unsupported | State-sync enum is recognized but database and trace-placement parity are unverified. The connector fails closed. |
+
+Unknown transaction types and mismatched family-specific types fail the entire requested range;
+they are never imported as legacy transactions.
 
 **Backfill only.** Realtime keeps following the chain head over JSON-RPC, where Blockscout's reorg
 detection lives. That is deliberate — it is the riskiest part of an explorer and the part least
