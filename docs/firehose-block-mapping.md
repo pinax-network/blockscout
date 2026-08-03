@@ -165,9 +165,16 @@ diffing frame-by-frame; see [firehose-parity.md](firehose-parity.md).
 **1. `Block.system_calls` — outside `transaction_traces` entirely.**
 Chain-level system operations live in their own top-level field. A node's tracer reports them
 nested inside the chain's system transaction (on Arbitrum, the ArbOS internal transaction at index
-0 by convention, type `TRX_TYPE_ARBITRUM_INTERNAL`). The connector locates that transaction by
-type rather than assuming its position. They form their own `index`/`parent_index` tree. Ignoring
-them cost 2 internal transactions per block — ~2.5% of the total on Robinhood Chain.
+0 by convention, type `TRX_TYPE_ARBITRUM_INTERNAL`). A block can contain more than one internal
+transaction, so the connector selects the typed transaction at index 0 rather than assuming it is
+the first trace. They form their own `index`/`parent_index` tree. Ignoring them cost 2 internal
+transactions per block — ~2.5% of the total on Robinhood Chain.
+
+When a block has multiple ArbOS internal transactions and the Firehose hierarchy cannot be shown
+to match `debug_traceBlockByNumber`, the sidecar marks the range for native trace fallback. The
+block, receipts, logs, and balances still come from Firehose; Blockscout leaves the range's
+`pending_block_operations` in place so its standard RPC trace fetcher completes the internal
+transactions.
 
 Ethereum Cancun/Prague protocol system calls have no transaction and are not returned by
 `debug_traceBlockByNumber`, so they are deliberately not attached to a user transaction. Their
