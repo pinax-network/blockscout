@@ -19,8 +19,10 @@ through this analysis, and it excludes token balances.
 | `nonce_changes` → nonces | recorded state | recorded, same class |
 | `storage_changes` → `balanceOf` | **inferred** | 94.2% best case — excluded |
 
-Recorded fields are what the node itself wrote down. Inferring `balanceOf` means guessing that a
-storage word *is* the balance, and that guess cannot be made safe — see below.
+Recorded fields are what the node itself wrote down. They still need commit-status filtering:
+balance changes from reverted calls are excluded, and failed transactions retain only the root
+gas/fee changes that the Firehose schema defines as persistent. Inferring `balanceOf` means
+guessing that a storage word *is* the balance, and that guess cannot be made safe — see below.
 
 ## The residual load
 

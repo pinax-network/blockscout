@@ -79,6 +79,25 @@ neither is present, and `GET /health` reports which mode is active:
 {"ok": true, "endpoint": "...", "source": "firehose", "auth": "api-key"}
 ```
 
+### Scaling catchup
+
+One Blockscout indexer already runs catchup ranges concurrently. The main controls are:
+
+| Variable | Effect |
+|---|---|
+| `INDEXER_CATCHUP_BLOCKS_CONCURRENCY` | Concurrent range requests from Blockscout; default `10` |
+| `INDEXER_CATCHUP_BLOCKS_BATCH_SIZE` | Blocks per range request; default `10` |
+| `FIREHOSE_WORKERS` | CPU-parallel sidecar processes |
+
+Raise sidecar workers and Blockscout concurrency together until the sidecar CPU, Firehose upstream,
+or database becomes the bottleneck. Larger batches amortise stream setup, but also increase memory,
+response size, and the chance that a range exceeds `INDEXER_FIREHOSE_TIMEOUT`.
+
+Do not scale catchup by starting several indexer replicas against the same database. The current
+`missing_block_ranges` reader does not claim or lease work: each replica can select the same newest
+ranges, producing duplicate Firehose streams and duplicate import attempts rather than useful
+horizontal speedup. True multi-instance backfill needs an atomic range-claim mechanism.
+
 ## Scope and limits
 
 **Backfill only.** Realtime keeps following the chain head over JSON-RPC, where Blockscout's reorg
@@ -87,8 +106,9 @@ worth destabilising.
 
 **Native balances are served from Firehose too.** `balance_changes` is recorded post-state, so
 coin balances arrive already valued and `Indexer.Fetcher.CoinBalance` never issues `eth_getBalance`
-for them. Verified end to end: 300 of 300 balances in Blockscout's own database match
-`eth_getBalance` at the same block exactly.
+for them. The connector excludes reverted-call changes and, for failed transactions, keeps only
+the root gas/fee changes that the Firehose schema defines as persistent. Verified end to end: 300
+of 300 balances in Blockscout's own database match `eth_getBalance` at the same block exactly.
 
 **Blockscout still needs node access** for token balances and token/NFT metadata, which go through
 `eth_call`.

@@ -152,7 +152,7 @@ defmodule EthereumJSONRPC.FirehoseTest do
 
     test "asks the sidecar for an ascending span when the range descends" do
       # the catchup fetcher walks backwards, so it hands down ranges like 70..61
-      stub_sidecar([entry(64)])
+      stub_sidecar(Enum.map(61..70, &entry/1))
 
       assert {:ok, _range_data} = Firehose.fetch_range(70..61//-1)
 
@@ -160,7 +160,7 @@ defmodule EthereumJSONRPC.FirehoseTest do
     end
 
     test "passes an ascending range through unchanged" do
-      stub_sidecar([entry(64)])
+      stub_sidecar(Enum.map(61..70, &entry/1))
 
       assert {:ok, _range_data} = Firehose.fetch_range(61..70)
 
@@ -198,6 +198,34 @@ defmodule EthereumJSONRPC.FirehoseTest do
 
       assert {:ok, %{blocks: %Blocks{blocks_params: [], errors: [error]}}} = Firehose.fetch_range(64..64)
       assert %{code: 404, data: %{number: 64}} = error
+    end
+
+    test "rejects a partial range so omitted blocks stay in missing_block_ranges" do
+      stub_sidecar([entry(64)])
+
+      assert {:error, {:firehose_range_mismatch, %{missing: [65], duplicates: [], unexpected: []}}} =
+               Firehose.fetch_range(64..65)
+    end
+
+    test "rejects duplicate and out-of-range block entries" do
+      stub_sidecar([entry(63), entry(64), entry(64)])
+
+      assert {:error, {:firehose_range_mismatch, %{missing: [], duplicates: [64], unexpected: [63]}}} =
+               Firehose.fetch_range(64..64)
+    end
+
+    test "rejects a block whose receipts do not cover every transaction" do
+      stub_sidecar([put_in(entry(64), ["receipts"], [])])
+
+      assert {:error, {:firehose_invalid_entry, 64, :receipt_transaction_mismatch}} =
+               Firehose.fetch_range(64..64)
+    end
+
+    test "rejects a block whose traces do not cover every transaction" do
+      stub_sidecar([put_in(entry(64), ["traces"], [])])
+
+      assert {:error, {:firehose_invalid_entry, 64, :trace_transaction_mismatch}} =
+               Firehose.fetch_range(64..64)
     end
 
     test "returns an error tuple when the sidecar answers with a non-200" do

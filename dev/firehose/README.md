@@ -67,10 +67,16 @@ version.
 ## Running against a Firehose endpoint
 
 ```bash
-cd dev/firehose && npm install
+cd dev/firehose && npm ci
 cp .env.example .env    # then fill in FIREHOSE_ENDPOINT and your auth
 node firehose-sidecar.js
 ```
+
+Blockscout parallelizes catchup inside one indexer instance. Increase
+`INDEXER_CATCHUP_BLOCKS_CONCURRENCY` alongside `FIREHOSE_WORKERS`; the defaults are 10 concurrent
+ranges and `cores - 2` sidecar processes. Multiple catchup-enabled indexer replicas sharing one
+database are not a scaling mechanism today because they can select the same unclaimed missing
+ranges and duplicate the work.
 
 Or pass them inline:
 

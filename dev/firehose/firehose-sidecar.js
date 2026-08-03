@@ -204,10 +204,17 @@ function buildCallTree(calls) {
   return root;
 }
 
+const FAILED_TRANSACTION_BALANCE_REASONS = new Set([
+  "REASON_GAS_BUY",
+  "REASON_GAS_REFUND",
+  "REASON_REWARD_TRANSACTION_FEE",
+]);
+
 // Final native balance per account in the block. balance_changes are recorded state - the node
-// wrote these values down - so unlike a storage-derived token balance they need no interpretation
-// and verify 1:1 against eth_getBalance. Ordinals give the total order, so the highest-ordinal
-// change per address is the end-of-block value.
+// wrote these values down - but the extended model also retains state changes from reverted calls.
+// Successful transactions contribute only non-reverted calls. For failed transactions, Firehose's
+// contract says only the root call's gas buy/refund and transaction fee changes survive. Ordinals
+// give the total order, so the highest committed change per address is the end-of-block value.
 function coinBalances(block) {
   const final = new Map();
   const take = (bc) => {
@@ -218,10 +225,25 @@ function coinBalances(block) {
     if (!prev || ordinal > prev.ordinal) final.set(address, { ordinal, value: bigIntQty(bc.newValue) });
   };
 
-  for (const bc of block.balanceChanges || []) take(bc);      // block-level, e.g. rewards
-  for (const c of block.systemCalls || []) for (const bc of c.balanceChanges || []) take(bc);
-  for (const t of block.transactionTraces || [])
-    for (const c of t.calls || []) for (const bc of c.balanceChanges || []) take(bc);
+  for (const bc of block.balanceChanges || []) take(bc); // block-level, e.g. rewards
+  for (const call of block.systemCalls || []) {
+    if (!call.stateReverted) for (const bc of call.balanceChanges || []) take(bc);
+  }
+
+  for (const transaction of block.transactionTraces || []) {
+    const calls = transaction.calls || [];
+
+    if (transaction.status === "SUCCEEDED") {
+      for (const call of calls) {
+        if (!call.stateReverted) for (const bc of call.balanceChanges || []) take(bc);
+      }
+    } else if (transaction.status === "FAILED" || transaction.status === "REVERTED") {
+      const rootCall = calls.find((call) => Number(call.parentIndex || 0) === 0);
+      for (const bc of (rootCall && rootCall.balanceChanges) || []) {
+        if (FAILED_TRANSACTION_BALANCE_REASONS.has(bc.reason)) take(bc);
+      }
+    }
+  }
 
   return [...final].map(([address, v]) => ({ address, value: v.value }));
 }
@@ -297,16 +319,14 @@ function convertBlock(block) {
   // that was 2 internal transactions per block, ~2.5% of the total.
   const systemFrame = buildCallTree(block.systemCalls);
 
-  const callTraces = traces
-    .map((t) => {
-      const result = buildCallTree(t.calls);
-      if (!result) return null;
-      if (systemFrame && isSystemTransaction(t)) {
-        (result.calls = result.calls || []).push(systemFrame);
-      }
-      return { txHash: hex(t.hash), result };
-    })
-    .filter(Boolean);
+  const callTraces = traces.map((t) => {
+    const result = buildCallTree(t.calls);
+    if (!result) throw new Error(`transaction ${hex(t.hash)} has no call trace`);
+    if (systemFrame && isSystemTransaction(t)) {
+      (result.calls = result.calls || []).push(systemFrame);
+    }
+    return { txHash: hex(t.hash), result };
+  });
 
   return {
     number,
@@ -424,8 +444,42 @@ function fetchRange(startBlock, endBlock) {
       }
       reject(new Error(`firehose stream: ${e.details || e.message}`));
     });
-    stream.on("end", () => resolve(out));
+    stream.on("end", () => {
+      try {
+        validateFetchedRange(out, startBlock, endBlock);
+        resolve(out);
+      } catch (e) {
+        reject(e);
+      }
+    });
   });
+}
+
+function validateFetchedRange(blocks, startBlock, endBlock) {
+  const expected = endBlock - startBlock + 1;
+  const counts = new Map();
+  for (const block of blocks) counts.set(block.number, (counts.get(block.number) || 0) + 1);
+
+  const missing = [];
+  for (let number = startBlock; number <= endBlock; number++) {
+    if (!counts.has(number)) missing.push(number);
+  }
+
+  const duplicates = [...counts]
+    .filter(([, count]) => count > 1)
+    .map(([number]) => number)
+    .sort((a, b) => a - b);
+  const unexpected = [...counts.keys()]
+    .filter((number) => number < startBlock || number > endBlock)
+    .sort((a, b) => a - b);
+
+  if (blocks.length !== expected || missing.length || duplicates.length || unexpected.length) {
+    throw new Error(
+      `incomplete firehose range ${startBlock}..${endBlock}: ` +
+        `missing=${JSON.stringify(missing)} duplicates=${JSON.stringify(duplicates)} ` +
+        `unexpected=${JSON.stringify(unexpected)}`
+    );
+  }
 }
 
 // ---------------------------------------------------------------- http server
@@ -494,25 +548,31 @@ function countFrames(frame) {
 // the kernel spread the accepted connections across them.
 const WORKERS = parseInt(process.env.FIREHOSE_WORKERS || String(Math.max(1, os.cpus().length - 2)), 10);
 
-if (cluster.isPrimary && !API_KEY && !BEARER_TOKEN) {
-  console.warn(
-    `[firehose] WARNING: neither FIREHOSE_API_KEY nor FIREHOSE_BEARER_TOKEN is set - requests to ` +
-      `${ENDPOINT} will be sent unauthenticated and will most likely be rejected. ` +
-      `See dev/firehose/.env.example`
-  );
+function start() {
+  if (cluster.isPrimary && !API_KEY && !BEARER_TOKEN) {
+    console.warn(
+      `[firehose] WARNING: neither FIREHOSE_API_KEY nor FIREHOSE_BEARER_TOKEN is set - requests to ` +
+        `${ENDPOINT} will be sent unauthenticated and will most likely be rejected. ` +
+        `See dev/firehose/.env.example`
+    );
+  }
+
+  if (cluster.isPrimary && WORKERS > 1) {
+    console.log(`[firehose] primary ${process.pid}: forking ${WORKERS} workers, upstream ${ENDPOINT}`);
+    for (let i = 0; i < WORKERS; i++) cluster.fork();
+    cluster.on("exit", (worker, code) => {
+      if (code !== 0) {
+        console.error(`[firehose] worker ${worker.process.pid} died (${code}), restarting`);
+        cluster.fork();
+      }
+    });
+  } else {
+    server.listen(PORT, () =>
+      console.log(`[firehose] worker ${process.pid} listening on :${PORT}, streaming from ${ENDPOINT}`)
+    );
+  }
 }
 
-if (cluster.isPrimary && WORKERS > 1) {
-  console.log(`[firehose] primary ${process.pid}: forking ${WORKERS} workers, upstream ${ENDPOINT}`);
-  for (let i = 0; i < WORKERS; i++) cluster.fork();
-  cluster.on("exit", (worker, code) => {
-    if (code !== 0) {
-      console.error(`[firehose] worker ${worker.process.pid} died (${code}), restarting`);
-      cluster.fork();
-    }
-  });
-} else {
-  server.listen(PORT, () =>
-    console.log(`[firehose] worker ${process.pid} listening on :${PORT}, streaming from ${ENDPOINT}`)
-  );
-}
+if (require.main === module) start();
+
+module.exports = { coinBalances, convertBlock, start, validateFetchedRange };
