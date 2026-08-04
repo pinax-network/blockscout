@@ -10,6 +10,7 @@ defmodule Explorer.SmartContract.SolcDownloader do
   alias Explorer.SmartContract.CompilerVersion
 
   @latest_compiler_refetch_time :timer.minutes(30)
+  @compiler_versions_refetch_time :timer.minutes(30)
 
   def ensure_exists(version) do
     path = file_path(version)
@@ -17,20 +18,7 @@ defmodule Explorer.SmartContract.SolcDownloader do
     if File.exists?(path) && version !== "latest" do
       path
     else
-      compiler_versions =
-        case CompilerVersion.fetch_versions(:solc) do
-          {:ok, compiler_versions} ->
-            compiler_versions
-
-          {:error, _} ->
-            []
-        end
-
-      if version in compiler_versions do
-        GenServer.call(__MODULE__, {:ensure_exists, version}, 60_000)
-      else
-        false
-      end
+      GenServer.call(__MODULE__, {:ensure_exists, version}, 60_000)
     end
   end
 
@@ -43,14 +31,34 @@ defmodule Explorer.SmartContract.SolcDownloader do
   def init([]) do
     File.mkdir(compiler_dir())
 
-    {:ok, []}
+    {:ok, %{compiler_versions: nil, compiler_versions_fetched_at: nil}}
   end
 
   # sobelow_skip ["Traversal"]
   @impl true
   def handle_call({:ensure_exists, version}, _from, state) do
-    path = file_path(version)
+    case compiler_versions(state) do
+      {:ok, compiler_versions, state} ->
+        {:reply, ensure_compiler_file(version, compiler_versions), state}
 
+      {:error, _reason} ->
+        {:reply, false, state}
+    end
+  end
+
+  defp ensure_compiler_file(version, compiler_versions) do
+    if version in compiler_versions do
+      path = file_path(version)
+
+      maybe_download_compiler(version, path)
+
+      path
+    else
+      false
+    end
+  end
+
+  defp maybe_download_compiler(version, path) do
     if fetch?(version, path) do
       temp_path = file_path("#{version}-tmp")
 
@@ -62,8 +70,40 @@ defmodule Explorer.SmartContract.SolcDownloader do
 
       File.rename(temp_path, path)
     end
+  end
 
-    {:reply, path, state}
+  defp compiler_versions(
+         %{
+           compiler_versions: compiler_versions,
+           compiler_versions_fetched_at: compiler_versions_fetched_at
+         } = state
+       )
+       when is_list(compiler_versions) and is_integer(compiler_versions_fetched_at) do
+    elapsed_time = System.monotonic_time(:millisecond) - compiler_versions_fetched_at
+
+    if elapsed_time < @compiler_versions_refetch_time do
+      {:ok, compiler_versions, state}
+    else
+      fetch_compiler_versions(state)
+    end
+  end
+
+  defp compiler_versions(state), do: fetch_compiler_versions(state)
+
+  defp fetch_compiler_versions(state) do
+    case CompilerVersion.fetch_versions(:solc) do
+      {:ok, compiler_versions} ->
+        state = %{
+          state
+          | compiler_versions: compiler_versions,
+            compiler_versions_fetched_at: System.monotonic_time(:millisecond)
+        }
+
+        {:ok, compiler_versions, state}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp fetch?("latest", path) do
