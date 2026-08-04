@@ -35,6 +35,7 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
 
   # milliseconds
   @timeout 60_000
+  @transaction_identifiers_batch_size 1_000
 
   @type imported :: [InternalTransaction.t()]
 
@@ -368,8 +369,12 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
           |> Enum.reject(&is_nil(Map.get(&1, :transaction_index)))
           |> Enum.map(&{&1.block_number, &1.transaction_index})
           |> Enum.uniq()
-          |> Transaction.by_block_number_index_query()
-          |> repo.all()
+          |> Enum.chunk_every(@transaction_identifiers_batch_size)
+          |> Enum.flat_map(fn block_number_index_pairs ->
+            block_number_index_pairs
+            |> Transaction.by_block_number_index_query()
+            |> repo.all()
+          end)
           |> Enum.map(& &1.hash)
 
         query =
@@ -452,35 +457,42 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactions do
       {:ok, []}
     else
       blocks_map = Map.new(transactions, &{&1.block_number, &1.block_hash})
+      transaction_identifiers = MapSet.new(transactions, &{&1.block_number, &1.index})
 
       valid_internal_transactions =
         internal_transactions_params
         |> Enum.group_by(& &1.block_number)
         |> Map.drop(invalid_block_numbers)
         |> Enum.flat_map(fn item ->
-          compose_entry_wrapper(item, blocks_map)
+          compose_entry_wrapper(item, blocks_map, transaction_identifiers)
         end)
 
       {:ok, valid_internal_transactions}
     end
   end
 
-  defp compose_entry_wrapper(item, blocks_map) do
+  defp compose_entry_wrapper(item, blocks_map, transaction_identifiers) do
     case item do
       {block_number, entries} ->
-        compose_entry(entries, block_number, blocks_map)
+        compose_entry(entries, block_number, blocks_map, transaction_identifiers)
 
       _ ->
         []
     end
   end
 
-  defp compose_entry(entries, block_number, blocks_map) do
+  defp compose_entry(entries, block_number, blocks_map, transaction_identifiers) do
     if Map.has_key?(blocks_map, block_number) do
-      entries
+      Enum.filter(entries, &acquired_transaction?(&1, block_number, transaction_identifiers))
     else
       []
     end
+  end
+
+  defp acquired_transaction?(entry, block_number, transaction_identifiers) do
+    transaction_index = Map.get(entry, :transaction_index)
+
+    is_nil(transaction_index) or MapSet.member?(transaction_identifiers, {block_number, transaction_index})
   end
 
   defp adjust_insert_params(internal_transactions_params) do

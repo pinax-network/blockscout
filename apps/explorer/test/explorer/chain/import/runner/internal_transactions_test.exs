@@ -3,7 +3,17 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactionsTest do
   use Explorer.DataCase
 
   alias Ecto.Multi
-  alias Explorer.Chain.{Block, Data, Wei, PendingBlockOperation, Transaction, InternalTransaction}
+
+  alias Explorer.Chain.{
+    Block,
+    Data,
+    InternalTransaction,
+    PendingBlockOperation,
+    PendingTransactionOperation,
+    Transaction,
+    Wei
+  }
+
   alias Explorer.Chain.Import.Runner.InternalTransactions
   alias Explorer.Migrator.DeleteZeroValueInternalTransactions
 
@@ -189,6 +199,68 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactionsTest do
              |> is_nil()
 
       assert is_nil(Repo.get(Transaction, pending.hash).block_hash)
+    end
+
+    test "ignores traces for transactions whose pending operation was already cleared" do
+      use_transaction_pending_operations()
+
+      block = insert(:block)
+      pending_transaction = insert(:transaction) |> with_block(block, index: 1, status: :ok)
+      completed_transaction = insert(:transaction) |> with_block(block, index: 8, status: :ok)
+
+      insert(:pending_transaction_operation, transaction_hash: pending_transaction.hash)
+
+      pending_changes = make_internal_transaction_changes(pending_transaction, 0, nil)
+      completed_changes = make_internal_transaction_changes(completed_transaction, 0, nil)
+
+      assert {:ok, _} = run_internal_transactions([pending_changes, completed_changes])
+
+      assert Repo.exists?(
+               from(i in InternalTransaction,
+                 where:
+                   i.block_number == ^pending_transaction.block_number and
+                     i.transaction_index == ^pending_transaction.index
+               )
+             )
+
+      refute Repo.exists?(
+               from(i in InternalTransaction,
+                 where:
+                   i.block_number == ^completed_transaction.block_number and
+                     i.transaction_index == ^completed_transaction.index
+               )
+             )
+
+      refute Repo.exists?(
+               from(operation in PendingTransactionOperation,
+                 where: operation.transaction_hash == ^pending_transaction.hash
+               )
+             )
+    end
+
+    test "chunks dense transaction identifier lookups" do
+      use_transaction_pending_operations()
+
+      block = insert(:block)
+      pending_transaction = insert(:transaction) |> with_block(block, index: 1, status: :ok)
+      insert(:pending_transaction_operation, transaction_hash: pending_transaction.hash)
+
+      base_changes = make_internal_transaction_changes(pending_transaction, 0, nil)
+
+      dense_changes =
+        Enum.map(1..8_040, fn transaction_index ->
+          Map.put(base_changes, :transaction_index, transaction_index)
+        end)
+
+      assert {:ok, _} = run_internal_transactions(dense_changes)
+
+      assert Repo.aggregate(InternalTransaction, :count) == 1
+
+      refute Repo.exists?(
+               from(operation in PendingTransactionOperation,
+                 where: operation.transaction_hash == ^pending_transaction.hash
+               )
+             )
     end
 
     test "removes consensus to blocks where transactions are missing" do
@@ -758,6 +830,18 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactionsTest do
       timestamps: %{inserted_at: DateTime.utc_now(), updated_at: DateTime.utc_now()}
     })
     |> Repo.transaction()
+  end
+
+  defp use_transaction_pending_operations do
+    original_config = Application.get_env(:ethereum_jsonrpc, EthereumJSONRPC.Geth)
+
+    Application.put_env(
+      :ethereum_jsonrpc,
+      EthereumJSONRPC.Geth,
+      Keyword.put(original_config, :block_traceable?, false)
+    )
+
+    on_exit(fn -> Application.put_env(:ethereum_jsonrpc, EthereumJSONRPC.Geth, original_config) end)
   end
 
   defp make_empty_block_changes(block_number), do: %{block_number: block_number}
