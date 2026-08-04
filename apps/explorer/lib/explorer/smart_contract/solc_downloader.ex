@@ -34,7 +34,6 @@ defmodule Explorer.SmartContract.SolcDownloader do
     {:ok, %{compiler_versions: nil, compiler_versions_fetched_at: nil}}
   end
 
-  # sobelow_skip ["Traversal"]
   @impl true
   def handle_call({:ensure_exists, version}, _from, state) do
     case compiler_versions(state) do
@@ -58,6 +57,7 @@ defmodule Explorer.SmartContract.SolcDownloader do
     end
   end
 
+  # sobelow_skip ["Traversal"]
   defp maybe_download_compiler(version, path) do
     if fetch?(version, path) do
       temp_path = file_path("#{version}-tmp")
