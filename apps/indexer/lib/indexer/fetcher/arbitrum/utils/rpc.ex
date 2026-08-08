@@ -132,15 +132,24 @@ defmodule Indexer.Fetcher.Arbitrum.Utils.Rpc do
       when is_list(requests_list) and is_binary(help_str) do
     error_message_generator = &"Cannot call #{help_str}. Error: #{inspect(&1)}"
 
+    {requests_with_unique_ids, original_id_by_unique_id} =
+      requests_list
+      |> Enum.with_index()
+      |> Enum.map_reduce(%{}, fn {request, unique_id}, original_ids ->
+        {Map.put(request, :id, unique_id), Map.put(original_ids, unique_id, Map.fetch!(request, :id))}
+      end)
+
     {:ok, responses} =
       IndexerHelper.repeated_batch_rpc_call(
-        requests_list,
+        requests_with_unique_ids,
         json_rpc_named_arguments,
         error_message_generator,
         @rpc_resend_attempts
       )
 
-    responses
+    Enum.map(responses, fn response ->
+      Map.update!(response, :id, &Map.fetch!(original_id_by_unique_id, &1))
+    end)
   end
 
   @doc """
