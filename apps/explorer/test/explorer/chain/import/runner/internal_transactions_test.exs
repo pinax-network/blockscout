@@ -833,15 +833,25 @@ defmodule Explorer.Chain.Import.Runner.InternalTransactionsTest do
   end
 
   defp use_transaction_pending_operations do
-    original_config = Application.get_env(:ethereum_jsonrpc, EthereumJSONRPC.Geth)
+    original_json_rpc_named_arguments = Application.get_env(:explorer, :json_rpc_named_arguments)
+    original_geth_config = Application.get_env(:ethereum_jsonrpc, EthereumJSONRPC.Geth)
+
+    Application.put_env(
+      :explorer,
+      :json_rpc_named_arguments,
+      Keyword.put(original_json_rpc_named_arguments, :variant, EthereumJSONRPC.Geth)
+    )
 
     Application.put_env(
       :ethereum_jsonrpc,
       EthereumJSONRPC.Geth,
-      Keyword.put(original_config, :block_traceable?, false)
+      Keyword.put(original_geth_config, :block_traceable?, false)
     )
 
-    on_exit(fn -> Application.put_env(:ethereum_jsonrpc, EthereumJSONRPC.Geth, original_config) end)
+    on_exit(fn ->
+      Application.put_env(:explorer, :json_rpc_named_arguments, original_json_rpc_named_arguments)
+      Application.put_env(:ethereum_jsonrpc, EthereumJSONRPC.Geth, original_geth_config)
+    end)
   end
 
   defp make_empty_block_changes(block_number), do: %{block_number: block_number}
